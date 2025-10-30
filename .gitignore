@@ -222,3 +222,6 @@ controlnet_test_*
 
 # Demo uploads directory
 demo/realtime-img2img/uploads/
+
+custom_processors/*
+!custom_processors/README.md

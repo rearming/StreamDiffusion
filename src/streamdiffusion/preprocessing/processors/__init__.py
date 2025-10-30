@@ -187,4 +187,176 @@ if MEDIAPIPE_POSE_AVAILABLE:
     __all__.append("MediaPipePosePreprocessor")
 
 if MEDIAPIPE_SEGMENTATION_AVAILABLE:
-    __all__.append("MediaPipeSegmentationPreprocessor") 
+    __all__.append("MediaPipeSegmentationPreprocessor")
+
+
+# =============================================================================
+# CUSTOM PROCESSOR DISCOVERY
+# =============================================================================
+
+import logging
+import os
+logger = logging.getLogger(__name__)
+
+def _discover_custom_processors():
+    """
+    Auto-discover custom processors from custom_processors/ folder.
+
+    Supports:
+    1. Processor collection repos with processors.yaml manifest
+    2. Standalone processor folders (fallback to auto-scan .py files)
+
+    Convention:
+    - Clone repos to custom_processors/<name>/
+    - Use absolute imports: from streamdiffusion.preprocessing.processors import BasePreprocessor
+    - Folder name becomes namespace for processors
+    """
+    import importlib.util
+    import inspect
+    from pathlib import Path
+
+    # Allow disabling in production/Docker
+    if os.getenv("STREAMDIFFUSION_DISABLE_CUSTOM_PROCESSORS") == "1":
+        logger.info("Custom processor discovery disabled via environment variable")
+        return
+
+    try:
+        # Navigate to repo_root/custom_processors/
+        repo_root = Path(__file__).parent.parent.parent.parent.parent
+        custom_dir = repo_root / "custom_processors"
+
+        if not custom_dir.exists():
+            logger.debug("custom_processors/ folder not found, skipping discovery")
+            return
+
+        logger.info("Scanning custom_processors/ folder for custom processors...")
+
+        # Scan for processor collections/folders
+        for item in custom_dir.iterdir():
+            if not item.is_dir() or item.name.startswith(('.', '_')):
+                continue
+
+            # Check for processors.yaml manifest
+            manifest_file = item / "processors.yaml"
+
+            if manifest_file.exists():
+                _load_processor_collection(item, manifest_file)
+            else:
+                # Fallback: auto-scan for .py files
+                _load_processor_folder_auto(item)
+
+    except Exception as e:
+        logger.error(f"Custom processor discovery failed: {e}")
+        import traceback
+        logger.debug(traceback.format_exc())
+
+
+def _load_processor_collection(collection_dir, manifest_file):
+    """Load processors from a collection with processors.yaml manifest"""
+    import yaml
+
+    try:
+        with open(manifest_file, 'r') as f:
+            manifest = yaml.safe_load(f)
+
+        collection_name = collection_dir.name
+        processor_files = manifest.get('processors', [])
+
+        if not processor_files:
+            logger.warning(f"Collection '{collection_name}' has empty processors list")
+            return
+
+        logger.info(f"Loading processor collection '{collection_name}' ({len(processor_files)} processors)")
+
+        for proc_file in processor_files:
+            if isinstance(proc_file, dict):
+                # Extended format with metadata
+                filename = proc_file.get('file')
+                enabled = proc_file.get('enabled', True)
+                if not enabled:
+                    logger.info(f"  Skipping disabled processor: {filename}")
+                    continue
+            else:
+                # Simple format: just filename
+                filename = proc_file
+
+            proc_path = collection_dir / filename
+
+            if not proc_path.exists():
+                logger.warning(f"  Processor file not found: {filename}")
+                continue
+
+            # Extract processor name from filename (strip .py)
+            proc_name = proc_path.stem
+
+            _load_processor_from_file(proc_path, proc_name)
+
+    except Exception as e:
+        logger.error(f"Failed to load collection from {collection_dir.name}: {e}")
+        import traceback
+        logger.debug(traceback.format_exc())
+
+
+def _load_processor_folder_auto(folder):
+    """Auto-discover processors by scanning for .py files (no manifest)"""
+    logger.info(f"Auto-scanning folder for processors: {folder.name}")
+
+    found_any = False
+    for py_file in folder.glob("*.py"):
+        # Skip special files
+        if py_file.name.startswith('_') or py_file.name in ['base.py', 'setup.py']:
+            continue
+
+        proc_name = py_file.stem
+        _load_processor_from_file(py_file, proc_name)
+        found_any = True
+
+    if not found_any:
+        logger.warning(f"  No processor files found in {folder.name}")
+
+
+def _load_processor_from_file(file_path, proc_name):
+    """Load a processor class from a Python file"""
+    import importlib.util
+    import inspect
+
+    try:
+        spec = importlib.util.spec_from_file_location(
+            f"custom_processors.{file_path.parent.name}.{file_path.stem}",
+            file_path
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        # Find processor class
+        found_classes = []
+        for name, obj in inspect.getmembers(module, inspect.isclass):
+            # Check if it's a valid processor (but not base classes)
+            if (issubclass(obj, (BasePreprocessor, PipelineAwareProcessor)) and
+                obj not in [BasePreprocessor, PipelineAwareProcessor]):
+                found_classes.append((name, obj))
+
+        if len(found_classes) == 0:
+            logger.warning(f"  No valid processor class found in {file_path.name}")
+            return
+
+        if len(found_classes) > 1:
+            logger.warning(f"  Multiple processor classes found in {file_path.name}, using first: {found_classes[0][0]}")
+
+        processor_class = found_classes[0][1]
+
+        # Check for name collision with core processors
+        if proc_name in _preprocessor_registry:
+            logger.error(f"  Name conflict: processor '{proc_name}' already exists in registry, skipping")
+            return
+
+        # Register the processor
+        register_preprocessor(proc_name, processor_class)
+        logger.info(f"  Registered custom processor: {proc_name} ({processor_class.__name__})")
+
+    except Exception as e:
+        logger.error(f"  Failed to load {file_path.name}: {e}")
+        import traceback
+        logger.debug(traceback.format_exc())
+
+_discover_custom_processors()

@@ -27,15 +27,27 @@ class PipelinePreprocessingOrchestrator(BaseOrchestrator[torch.Tensor, torch.Ten
     def _should_use_sync_processing(self, *args, **kwargs) -> bool:
         """
         Determine if synchronous processing should be used instead of pipelined.
-        
-        For pipeline preprocessing, we typically use pipelined processing since most
-        pipeline preprocessors are stateless and don't have temporal feedback requirements.
-        
+
+        Checks if any processor has requires_sync_processing=True attribute.
+        Pipeline-aware preprocessors (feedback, temporal, etc.) need synchronous processing
+        to avoid temporal artifacts and ensure access to previous pipeline outputs.
+
         Returns:
-            False - pipeline preprocessing can typically always use pipelined processing
+            True if any processor requires sync processing, False otherwise
         """
-        # Pipeline preprocessing generally doesn't require sync processing
-        # Most processors are stateless and work well with pipelining
+        # Check if any processor requires sync processing (e.g., FeedbackPreprocessor)
+        if len(args) < 1:
+            return False
+
+        processors = args[0]
+        if not processors:
+            return False
+
+        # Check each processor for requires_sync_processing attribute
+        for proc in processors:
+            if proc is not None and getattr(proc, 'requires_sync_processing', False):
+                return True
+
         return False
     
     def process_pipelined(self, 
