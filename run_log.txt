@@ -1,0 +1,10 @@
+[38;5;80mLoading StreamDiffusionTD...[0m
+                                                  
+
+Traceback (most recent call last):
+  File "X:\td\StreamDiffusion\StreamDiffusionTD\td_main.py", line 213, in <module>
+    print("\033[38;5;208m     \u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510")
+  File "D:\Program Files\Python311\Lib\encodings\cp1251.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode characters in position 16-55: character maps to <undefined>

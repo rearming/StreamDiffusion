@@ -966,27 +966,57 @@ class StreamDiffusionWrapper:
         except Exception as e:
             logger.warning(f"GPU cleanup warning: {e}")
         
-        # Reset CUDA context to prevent corruption from previous runs
+        # Light CUDA cleanup (avoid aggressive context reset - causes segfaults on RTX 50-series)
         torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-        # Force CUDA context reset by creating and destroying a small tensor
-        temp_tensor = torch.zeros(1, device=self.device)
-        del temp_tensor
-        logger.info("_load_model: CUDA context reset completed")
+        logger.info("_load_model: GPU memory cleanup completed")
 
-        # First, try to detect if this is an SDXL model before loading
-        # TODO: CAN we do this step with model_detection.py?
+        # Detect if this is an SDXL model before loading
         is_sdxl_model = False
         model_path_lower = model_id_or_path.lower()
         
-        # Check path for SDXL indicators
         if any(indicator in model_path_lower for indicator in ['sdxl', 'xl', '1024']):
             is_sdxl_model = True
             logger.info(f"_load_model: Path suggests SDXL model: {model_id_or_path}")
-        
-        # For .safetensor files, we need to be more careful about pipeline selection
-        if model_id_or_path.endswith('.safetensors'):
-            # For .safetensor files, try SDXL pipeline first if path suggests SDXL
+
+        # Try to resolve an fp16 single-file checkpoint for HuggingFace repos
+        # Many SDXL models are distributed as single-file checkpoints, not diffusers format.
+        # Loading the fp16 single-file is much more memory-efficient than loading fp32 + converting.
+        resolved_single_file = None
+        if not os.path.exists(model_id_or_path) and '/' in model_id_or_path and not model_id_or_path.endswith('.safetensors'):
+            try:
+                from huggingface_hub import list_repo_tree, hf_hub_download
+                repo_files = list(list_repo_tree(model_id_or_path))
+                st_files = [f for f in repo_files if hasattr(f, 'path') and f.path.endswith('.safetensors')]
+                fp16_files = [f for f in st_files if 'fp16' in f.path]
+                fp32_files = [f for f in st_files if 'fp16' not in f.path]
+
+                # Check if this is a single-file repo (no diffusers-format unet/ directory)
+                has_diffusers_format = any(
+                    hasattr(f, 'path') and f.path.startswith('unet/') and f.path.endswith('.safetensors')
+                    for f in repo_files
+                )
+
+                if not has_diffusers_format and (fp16_files or fp32_files):
+                    target = fp16_files[0] if (fp16_files and self.dtype == torch.float16) else (fp32_files[0] if fp32_files else None)
+                    if target:
+                        logger.info(f"_load_model: Single-file repo detected. Downloading {target.path} ({target.size/1e9:.1f} GB)...")
+                        resolved_single_file = hf_hub_download(model_id_or_path, target.path)
+                        logger.info(f"_load_model: Downloaded to {resolved_single_file}")
+            except Exception as e:
+                logger.warning(f"_load_model: HF repo inspection failed: {e}")
+
+        if resolved_single_file:
+            if is_sdxl_model:
+                loading_methods = [
+                    (StableDiffusionXLPipeline.from_single_file, "SDXL from_single_file"),
+                ]
+            else:
+                loading_methods = [
+                    (StableDiffusionPipeline.from_single_file, "SD from_single_file"),
+                    (StableDiffusionXLPipeline.from_single_file, "SDXL from_single_file"),
+                ]
+            model_id_or_path = resolved_single_file
+        elif model_id_or_path.endswith('.safetensors'):
             if is_sdxl_model:
                 loading_methods = [
                     (StableDiffusionXLPipeline.from_single_file, "SDXL from_single_file"),
@@ -1000,7 +1030,6 @@ class StreamDiffusionWrapper:
                     (StableDiffusionXLPipeline.from_single_file, "SDXL from_single_file")
                 ]
         else:
-            # For regular model directories or checkpoints, use the original order
             loading_methods = [
                 (AutoPipelineForText2Image.from_pretrained, "AutoPipeline from_pretrained"),
                 (StableDiffusionPipeline.from_single_file, "SD from_single_file"),
@@ -1009,23 +1038,34 @@ class StreamDiffusionWrapper:
 
         pipe = None
         last_error = None
+        _dbg_path = os.path.join(engine_dir, "load_debug.log") if engine_dir else "load_debug.log"
+        def _dbg(msg):
+            with open(_dbg_path, "a") as _f:
+                import datetime
+                _f.write(f"[{datetime.datetime.now()}] {msg}\n")
+                _f.flush()
+            logger.info(msg)
         for method, method_name in loading_methods:
             try:
-                logger.info(f"_load_model: Attempting to load with {method_name}...")
-                pipe = method(model_id_or_path).to(dtype=self.dtype)
+                kwargs = {"torch_dtype": self.dtype}
+
+                _dbg(f"Trying {method_name} for {model_id_or_path}...")
+                pipe = method(model_id_or_path, **kwargs)
+                _dbg(f"{method_name} loaded OK on CPU. Moving to {self.device}...")
+
+                pipe = pipe.to(device=self.device)
                 logger.info(f"_load_model: Successfully loaded using {method_name}")
                 
-                # Verify that we have the right pipeline type for SDXL models
                 if is_sdxl_model and not isinstance(pipe, StableDiffusionXLPipeline):
                     logger.warning(f"_load_model: SDXL model detected but loaded with non-SDXL pipeline: {type(pipe)}")
-                    # Try to explicitly load with SDXL pipeline instead
                     try:
                         logger.info(f"_load_model: Retrying with StableDiffusionXLPipeline...")
-                        pipe = StableDiffusionXLPipeline.from_single_file(model_id_or_path).to(dtype=self.dtype)
+                        pipe = StableDiffusionXLPipeline.from_single_file(
+                            model_id_or_path, torch_dtype=self.dtype
+                        ).to(device=self.device)
                         logger.info(f"_load_model: Successfully loaded using SDXL pipeline on retry")
                     except Exception as retry_error:
                         logger.warning(f"_load_model: SDXL pipeline retry failed: {retry_error}")
-                        # Continue with the originally loaded pipeline
                 
                 break
             except Exception as e:
@@ -1096,11 +1136,11 @@ class StreamDiffusionWrapper:
 
         if use_tiny_vae:
             if vae_id is not None:
-                stream.vae = AutoencoderTiny.from_pretrained(vae_id).to(dtype=pipe.dtype)
+                stream.vae = AutoencoderTiny.from_pretrained(vae_id).to(device=self.device, dtype=pipe.dtype)
             else:
                 # Use TAESD XL for SDXL models, regular TAESD for SD 1.5
                 taesd_model = "madebyollin/taesdxl" if is_sdxl else "madebyollin/taesd"
-                stream.vae = AutoencoderTiny.from_pretrained(taesd_model).to(dtype=pipe.dtype)
+                stream.vae = AutoencoderTiny.from_pretrained(taesd_model).to(device=self.device, dtype=pipe.dtype)
     
 
         try:
@@ -1606,6 +1646,10 @@ class StreamDiffusionWrapper:
         except Exception:
             import traceback
             traceback.print_exc()
+            # Write full traceback to file for debugging
+            _err_log = os.path.join(engine_dir, "acceleration_error.log") if engine_dir else "acceleration_error.log"
+            with open(_err_log, "w") as _f:
+                traceback.print_exc(file=_f)
             raise Exception("Acceleration has failed.")
 
         # Install modules via hooks instead of patching (wrapper keeps forwarding updates only)
@@ -2121,3 +2165,5 @@ class StreamDiffusionWrapper:
 
 
 
+
+# padding                                                                                                                                                             

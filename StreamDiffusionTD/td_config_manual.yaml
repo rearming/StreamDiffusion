@@ -1,0 +1,54 @@
+model_id: "stabilityai/sd-turbo"
+
+t_index_list: [1]
+width: 512
+height: 512
+device: "cuda"
+dtype: "float16"
+
+guidance_scale: 1.0
+num_inference_steps: 50
+seed: -1
+delta: 1.0
+
+prompt: "psychedelic neon fractal, vibrant colors"
+negative_prompt: ""
+
+mode: "txt2img"
+frame_buffer_size: 1
+use_denoising_batch: true
+use_lcm_lora: true
+use_tiny_vae: true
+acceleration: "none"
+cfg_type: "none"
+do_add_noise: true
+warmup: 10
+use_safety_checker: false
+skip_diffusion: false
+compile_engines_only: false
+build_engines_if_missing: true
+
+enable_similar_image_filter: false
+similar_image_filter_threshold: 0.99
+similar_image_filter_max_skip_frame: 1
+
+hf_cache: "X:/hf_cache"
+engine_dir: "X:/td/StreamDiffusion/engines/td"
+
+use_controlnet: false
+controlnets: []
+
+use_ipadapter: false
+ipadapters:
+  - ipadapter_model_path: "dummy"
+    image_encoder_path: "dummy"
+    scale: 0.0
+    enabled: false
+    type: regular
+
+td_settings:
+  osc_receive_port: 8567
+  osc_transmit_port: 8577
+  input_mem_name: "StreamDiffusionTD_512-512"
+  output_mem_name: "StreamDiffusionTD_512-512_out"
+  debug_mode: true

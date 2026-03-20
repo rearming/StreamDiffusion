@@ -1,0 +1,34 @@
+SpoutGL version: unknown
+
+All attributes:
+  SenderInfo
+  SpoutReceiver
+  SpoutSender
+  enums
+  helpers
+
+SpoutSender methods:
+  closeOpenGL
+  createMemoryBuffer
+  createOpenGL
+  deleteMemoryBuffer
+  getActiveSender
+  getAutoShare
+  getCPU
+  getCPUshare
+  getFrame
+  getGLDX
+  getMemoryBufferSize
+  getSenderInfo
+  isGLDXReady
+  releaseSender
+  sendFbo
+  sendImage
+  sendTexture
+  setActiveSender
+  setAutoShare
+  setCPUshare
+  setFrameSync
+  setSenderName
+  waitFrameSync
+  writeMemoryBuffer

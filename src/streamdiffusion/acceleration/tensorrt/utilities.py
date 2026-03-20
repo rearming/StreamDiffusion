@@ -19,6 +19,7 @@
 #
 
 import gc
+import warnings
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, List, Optional, Tuple, Union
@@ -244,8 +245,16 @@ class Engine:
 
         config_kwargs = {}
 
+        GiB = 2**30
+        memory_limits = {}
         if workspace_size > 0:
-            config_kwargs["memory_pool_limits"] = {trt.MemoryPoolType.WORKSPACE: workspace_size}
+            # Cap workspace at 4 GiB to reduce LLVM compilation memory pressure (RTX 50-series)
+            capped = min(workspace_size, 4 * GiB)
+            memory_limits[trt.MemoryPoolType.WORKSPACE] = capped
+        # Limit tactic DRAM to 8 GiB to prevent LLVM OOM on Blackwell GPUs
+        memory_limits[trt.MemoryPoolType.TACTIC_DRAM] = 8 * GiB
+        if memory_limits:
+            config_kwargs["memory_pool_limits"] = memory_limits
         if not enable_all_tactics:
             config_kwargs["tactic_sources"] = []
 
@@ -546,8 +555,11 @@ def export_onnx(
     
     wrapped_model = model  # Default: use model as-is
     
-    # Apply SDXL wrapper for SDXL models (in practice, always UnifiedExportWrapper)
-    if is_sdxl and not is_controlnet:
+    is_vae = isinstance(model_data, (VAE, VAEEncoder))
+    
+    if is_vae:
+        logger.info(f"Exporting {model_data.name} (no SDXL wrapping needed)...")
+    elif is_sdxl and not is_controlnet:
         embedding_dim = getattr(model_data, 'embedding_dim', 'unknown')
         logger.info(f"Detected SDXL model (embedding_dim={embedding_dim}), using wrapper for ONNX export...")
         from .export_wrappers.unet_sdxl_export import SDXLExportWrapper
@@ -573,18 +585,19 @@ def export_onnx(
         # Determine if we need external data format for large models (like SDXL)
         is_large_model = is_sdxl or (hasattr(model, 'config') and getattr(model.config, 'sample_size', 32) >= 64)
         
-        # Export ONNX normally first
-        torch.onnx.export(
-            wrapped_model,
-            inputs,
-            onnx_path,
-            export_params=True,
-            opset_version=onnx_opset,
-            do_constant_folding=True,
-            input_names=model_data.get_input_names(),
-            output_names=model_data.get_output_names(),
-            dynamic_axes=model_data.get_dynamic_axes(),
-        )
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=torch.jit.TracerWarning)
+            torch.onnx.export(
+                wrapped_model,
+                inputs,
+                onnx_path,
+                export_params=True,
+                opset_version=onnx_opset,
+                do_constant_folding=True,
+                input_names=model_data.get_input_names(),
+                output_names=model_data.get_output_names(),
+                dynamic_axes=model_data.get_dynamic_axes(),
+            )
         
         # Convert to external data format for large models (SDXL)
         if is_large_model:
@@ -655,9 +668,30 @@ def optimize_onnx(
         logger.info(f"ONNX optimization complete with external data")
         
     else:
-        # Standard optimization for smaller models
-        onnx_opt_graph = model_data.optimize(onnx.load(onnx_path))
-        onnx.save(onnx_opt_graph, onnx_opt_path)
+        # Check total size including external data files in the same directory
+        source_size = os.path.getsize(onnx_path)
+        total_size = sum(
+            os.path.getsize(os.path.join(onnx_dir, f))
+            for f in os.listdir(onnx_dir)
+        )
+        is_large_model = total_size > 512 * 1024 * 1024  # >512MB total
+
+        if is_large_model:
+            logger.info(f"Large ONNX model (total {total_size / (1024**3):.2f} GB), skipping graphsurgeon optimization")
+            logger.info("TensorRT will optimize during engine build.")
+            # Copy ONNX and all external data files to opt path directory
+            import shutil
+            opt_dir = os.path.dirname(onnx_opt_path)
+            os.makedirs(opt_dir, exist_ok=True)
+            shutil.copy2(onnx_path, onnx_opt_path)
+            for f in os.listdir(onnx_dir):
+                src = os.path.join(onnx_dir, f)
+                dst = os.path.join(opt_dir, f)
+                if src != onnx_path and os.path.isfile(src):
+                    shutil.copy2(src, dst)
+        else:
+            onnx_opt_graph = model_data.optimize(onnx.load(onnx_path))
+            onnx.save(onnx_opt_graph, onnx_opt_path)
     
     del onnx_opt_graph
     gc.collect()

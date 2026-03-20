@@ -1000,6 +1000,7 @@ class StreamDiffusion:
         return x_output
 
     def txt2img_sd_turbo(self, batch_size: int = 1) -> torch.Tensor:
+        logger.info(f"[DEBUG] txt2img_sd_turbo called, batch_size={batch_size}")
         x_t_latent = torch.randn(
             (batch_size, 4, self.latent_height, self.latent_width),
             device=self.device,

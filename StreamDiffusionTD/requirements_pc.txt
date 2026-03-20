@@ -1,0 +1,13 @@
+git+https://github.com/dotsimulate/StreamDiffusion.git@main#egg=streamdiffusion[tensorrt]
+
+huggingface-hub==0.24.6
+opencv-python
+pywin32
+numpy==1.26.4
+Pillow
+fire
+mss
+matplotlib
+python-osc
+einops
+peft==0.12.0

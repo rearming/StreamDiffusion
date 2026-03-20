@@ -46,18 +46,19 @@ class Optimizer:
                 self.graph.outputs[i].name = name
 
     def fold_constants(self, return_onnx=False):
-        onnx_graph = fold_constants(gs.export_onnx(self.graph), allow_onnxruntime_shape_inference=True)
-        self.graph = gs.import_onnx(onnx_graph)
+        # Skip fold_constants - causes segfault on RTX 50-series (Blackwell)
+        # TensorRT performs its own constant folding during engine build
+        print("NOTE: Skipping fold_constants (RTX 50-series workaround)")
         if return_onnx:
-            return onnx_graph
+            return gs.export_onnx(self.graph)
 
     def infer_shapes(self, return_onnx=False):
         onnx_graph = gs.export_onnx(self.graph)
-        if onnx_graph.ByteSize() > 2147483648:
-            print(f"⚠️ Model size ({onnx_graph.ByteSize() / (1024**3):.2f} GB) exceeds 2GB - this is normal for SDXL models")
-            print("🔧 ONNX shape inference will be skipped for large models to avoid memory issues")
-            # For large models like SDXL, skip shape inference to avoid memory/size issues
-            # The model will still work with TensorRT's own shape inference during engine building
+        # Skip ONNX shape inference for large models - causes OOM on RTX 50-series
+        # TensorRT performs its own shape inference during engine build
+        size_gb = onnx_graph.ByteSize() / (1024**3)
+        if onnx_graph.ByteSize() > 1024 * 1024 * 1024:  # >1GB
+            print(f"NOTE: Skipping ONNX shape inference for large model ({size_gb:.2f} GB) - TensorRT will handle it")
         else:
             onnx_graph = shape_inference.infer_shapes(onnx_graph)
 

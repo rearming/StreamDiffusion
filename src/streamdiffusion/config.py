@@ -126,19 +126,20 @@ def _extract_wrapper_params(config: Dict[str, Any]) -> Dict[str, Any]:
         'normalize_seed_weights': config.get('normalize_seed_weights', True),
         'compile_engines_only': config.get('compile_engines_only', False),
     }
-    if 'controlnets' in config and config['controlnets']:
+    # Respect explicit use_controlnet flag even when entries exist
+    if config.get('use_controlnet', False) and 'controlnets' in config and config['controlnets']:
         param_map['use_controlnet'] = True
         param_map['controlnet_config'] = _prepare_controlnet_configs(config)
     else:
-        param_map['use_controlnet'] = config.get('use_controlnet', False)
+        param_map['use_controlnet'] = False
         param_map['controlnet_config'] = config.get('controlnet_config')
     
-    # Set IPAdapter usage if IPAdapters are configured
-    if 'ipadapters' in config and config['ipadapters']:
+    # Set IPAdapter usage — respect explicit use_ipadapter flag even when entries exist
+    if config.get('use_ipadapter', False) and 'ipadapters' in config and config['ipadapters']:
         param_map['use_ipadapter'] = True
         param_map['ipadapter_config'] = _prepare_ipadapter_configs(config)
     else:
-        param_map['use_ipadapter'] = config.get('use_ipadapter', False)
+        param_map['use_ipadapter'] = False
         param_map['ipadapter_config'] = config.get('ipadapter_config')
     
     # Pipeline hook configurations (Phase 4: Configuration Integration)
