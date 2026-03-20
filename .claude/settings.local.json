@@ -4,7 +4,18 @@
       "Bash(ls -lh /X/td/StreamDiffusion/*.py)",
       "Bash(python:*)",
       "Bash(X:/td/StreamDiffusion/venv/Scripts/python.exe X:/td/StreamDiffusion/server_preview_vid2vid.py --video \"C:/Users/olegp/Downloads/videoplayback.mp4\" 2>&1)",
-      "Bash(X:/td/StreamDiffusion/venv/Scripts/python.exe X:/td/StreamDiffusion/server_preview_vid2vid.py --video \"C:/Users/olegp/Downloads/videoplayback.mp4\" --no-ipadapter 2>&1)"
+      "Bash(X:/td/StreamDiffusion/venv/Scripts/python.exe X:/td/StreamDiffusion/server_preview_vid2vid.py --video \"C:/Users/olegp/Downloads/videoplayback.mp4\" --no-ipadapter 2>&1)",
+      "Bash(dir X:hf_cache)",
+      "Bash(dir X:hf_cachehub)",
+      "Bash(dir /s /b X:hf_cachehubmodels--xinsir--controlnet-depth-sdxl-1.0snapshots)",
+      "Bash(find X:/hf_cache/hub/models--xinsir--controlnet-depth-sdxl-1.0/ -name *.safetensors -o -name *.bin -o -name config.json)",
+      "Bash(cmd //c \"dir /s X:\\\\hf_cache\\\\hub\\\\models--xinsir--controlnet-depth-sdxl-1.0\")",
+      "Bash(cmd //c \"dir X:\\\\hf_cache\\\\hub\")",
+      "Bash(cmd //c \"dir X:\\\\hf_cache\\\\hub\\\\\" 2>&1)",
+      "Bash(X:/td/StreamDiffusion/venv/Scripts/python.exe X:/td/StreamDiffusion/server_preview_vid2vid.py --video \"C:/Users/olegp/Downloads/videoplayback.mp4\" --model sdxl-turbo --no-ipadapter 2>&1)",
+      "Bash(netstat -ano)",
+      "Bash(ls -1 X:/td/StreamDiffusion/src/streamdiffusion/preprocessing/processors/*.py)",
+      "Bash(X:/td/StreamDiffusion/venv/Scripts/python.exe X:/td/StreamDiffusion/server_preview_vid2vid.py --video \"C:/Users/olegp/Downloads/videoplayback.mp4\" --model sdxl-turbo --controlnet depth-sdxl --no-ipadapter)"
     ]
   }
 }
