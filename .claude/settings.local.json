@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls -lh /X/td/StreamDiffusion/*.py)",
+      "Bash(python:*)",
+      "Bash(X:/td/StreamDiffusion/venv/Scripts/python.exe X:/td/StreamDiffusion/server_preview_vid2vid.py --video \"C:/Users/olegp/Downloads/videoplayback.mp4\" 2>&1)",
+      "Bash(X:/td/StreamDiffusion/venv/Scripts/python.exe X:/td/StreamDiffusion/server_preview_vid2vid.py --video \"C:/Users/olegp/Downloads/videoplayback.mp4\" --no-ipadapter 2>&1)"
+    ]
+  }
+}
