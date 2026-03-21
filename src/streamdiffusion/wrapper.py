@@ -251,6 +251,7 @@ class StreamDiffusionWrapper:
         self.set_nsfw_fallback_img(height, width)
         self.safety_checker_fallback_type = safety_checker_fallback_type
         self.safety_checker_threshold = safety_checker_threshold
+        self._text_encoder_offloaded = False
 
         self.stream: StreamDiffusion = self._load_model(
             model_id_or_path=model_id_or_path,
@@ -307,6 +308,11 @@ class StreamDiffusionWrapper:
         self._acceleration = acceleration
         self._engine_dir = engine_dir
 
+        # Offload text encoders to CPU after initial prepare (saves ~5GB VRAM for SDXL)
+        # They're only needed when encoding new prompts — moved back on-demand
+        if acceleration == "tensorrt":
+            self._offload_text_encoders()
+
         if device_ids is not None:
             self.stream.unet = torch.nn.DataParallel(
                 self.stream.unet, device_ids=device_ids
@@ -316,6 +322,61 @@ class StreamDiffusionWrapper:
             self.stream.enable_similar_image_filter(
                 similar_image_filter_threshold, similar_image_filter_max_skip_frame
             )
+
+    def _offload_text_encoders(self):
+        """Move text encoders to CPU to free GPU memory for TRT engines."""
+        stream = getattr(self, 'stream', None)
+        if stream is None:
+            return
+        self._do_text_encoder_move(stream, target='cpu')
+
+    def _reload_text_encoders(self):
+        """Temporarily move text encoders back to GPU for prompt encoding."""
+        if not self._text_encoder_offloaded:
+            return
+        stream = getattr(self, 'stream', None)
+        if stream is None:
+            return
+        self._do_text_encoder_move(stream, target=self.device)
+        self._text_encoder_offloaded = False
+
+    def _do_text_encoder_move(self, stream, target: str):
+        """Move all text encoder references (pipe + stream) to target device.
+        Key: stream.text_encoder and pipe.text_encoder may be the same object
+        or separate references. We must update ALL of them."""
+        import gc
+        pipe = getattr(stream, 'pipe', None)
+        if pipe is None:
+            return
+
+        moved = []
+        for attr in ('text_encoder', 'text_encoder_2'):
+            pipe_enc = getattr(pipe, attr, None)
+            stream_enc = getattr(stream, attr, None)
+            same_obj = pipe_enc is not None and stream_enc is not None and pipe_enc is stream_enc
+
+            if pipe_enc is not None and hasattr(pipe_enc, 'to'):
+                try:
+                    new_enc = pipe_enc.to(target)
+                    setattr(pipe, attr, new_enc)
+                    if same_obj:
+                        setattr(stream, attr, new_enc)
+                    moved.append(attr)
+                except Exception:
+                    pass
+
+            # Handle case where stream has a different reference
+            if not same_obj and stream_enc is not None and hasattr(stream_enc, 'to'):
+                try:
+                    setattr(stream, attr, stream_enc.to(target))
+                except Exception:
+                    pass
+
+        if moved and target == 'cpu':
+            gc.collect()
+            torch.cuda.empty_cache()
+            self._text_encoder_offloaded = True
+            logger.info(f"Offloaded {', '.join(moved)} to CPU (frees VRAM for TRT engines)")
 
     def prepare(
         self,
@@ -358,6 +419,9 @@ class StreamDiffusionWrapper:
             Method for interpolating between seed noise tensors, by default "linear".
         """
 
+
+        # Reload text encoders if offloaded (needed for prompt encoding)
+        self._reload_text_encoders()
 
         # Handle both single prompt and prompt blending
         if isinstance(prompt, str):
@@ -404,6 +468,9 @@ class StreamDiffusionWrapper:
         else:
             raise TypeError(f"prepare: prompt must be str or List[Tuple[str, float]], got {type(prompt)}")
 
+        # Offload text encoders again after encoding
+        self._offload_text_encoders()
+
     def update_prompt(
         self,
         prompt: Union[str, List[Tuple[str, float]]],
@@ -435,6 +502,9 @@ class StreamDiffusionWrapper:
         warn_about_conflicts : bool, optional
             Whether to warn about conflicts when switching between modes, by default True.
         """
+        # Reload text encoders if offloaded (needed for prompt encoding)
+        self._reload_text_encoders()
+
         # Handle both single prompt and prompt blending
         if isinstance(prompt, str):
             # Single prompt mode
@@ -471,6 +541,9 @@ class StreamDiffusionWrapper:
 
         else:
             raise TypeError(f"update_prompt: prompt must be str or List[Tuple[str, float]], got {type(prompt)}")
+
+        # Offload text encoders again after encoding
+        self._offload_text_encoders()
 
     def update_stream_params(
         self,
@@ -545,6 +618,11 @@ class StreamDiffusionWrapper:
         safety_checker_threshold : Optional[float]
             The threshold for the safety checker.
         """
+        # Reload text encoders if prompt encoding might be needed
+        needs_encoder = prompt_list is not None or negative_prompt is not None
+        if needs_encoder:
+            self._reload_text_encoders()
+
         # Handle all parameters via parameter updater (including ControlNet)
         self.stream._param_updater.update_stream_params(
             num_inference_steps=num_inference_steps,
@@ -570,6 +648,10 @@ class StreamDiffusionWrapper:
             self.use_safety_checker = use_safety_checker and (self._acceleration == "tensorrt")
         if safety_checker_threshold is not None:
             self.safety_checker_threshold = safety_checker_threshold
+
+        # Offload text encoders again if we reloaded them
+        if needs_encoder:
+            self._offload_text_encoders()
 
     def __call__(
         self,
@@ -1071,7 +1153,9 @@ class StreamDiffusionWrapper:
                 
                 break
             except Exception as e:
-                logger.warning(f"_load_model: {method_name} failed: {e}")
+                import traceback as _tb
+                logger.warning(f"_load_model: {method_name} failed: {type(e).__name__}: {e}")
+                _tb.print_exc()
                 last_error = e
                 continue
 
@@ -1561,7 +1645,20 @@ class StreamDiffusionWrapper:
                         stream.vae.config = vae_config
                         stream.vae.dtype = vae_dtype
                         logger.info("TensorRT VAE engines loaded successfully")
-                        
+
+                        # Delete PyTorch UNet+VAE entirely — TRT replaces them
+                        # This frees ~3.5GB GPU + ~7GB RAM for SDXL models
+                        if hasattr(stream, 'pipe'):
+                            if hasattr(stream.pipe, 'unet') and stream.pipe.unet is not None:
+                                del stream.pipe.unet
+                                stream.pipe.unet = None
+                                logger.info("Deleted PyTorch UNet (TRT UNet active)")
+                            if hasattr(stream.pipe, 'vae') and stream.pipe.vae is not None:
+                                del stream.pipe.vae
+                                stream.pipe.vae = None
+                                logger.info("Deleted PyTorch VAE (TRT VAE active)")
+                        import gc; gc.collect(); torch.cuda.empty_cache(); gc.collect()
+
                     except Exception as e:
                         error_msg = str(e).lower()
                         is_oom_error = ('out of memory' in error_msg or 'outofmemory' in error_msg or 
@@ -1692,49 +1789,86 @@ class StreamDiffusionWrapper:
                 stream._controlnet_module = cn_module
 
                 try:
-                    # Skip ControlNet TensorRT compilation — it segfaults on Blackwell/5080
-                    # The PyTorch ControlNet will be used instead (still fast, UNet+VAE are TRT)
-                    import torch
-                    _gpu_cap = torch.cuda.get_device_capability(0) if torch.cuda.is_available() else (0, 0)
-                    _skip_cn_trt = _gpu_cap[0] >= 12  # Blackwell = compute 12.0
-                    if _skip_cn_trt:
-                        print(f"[TRT] Skipping ControlNet TRT engine build (compute {_gpu_cap[0]}.{_gpu_cap[1]} / Blackwell) — using PyTorch ControlNet", flush=True)
-
-                    print("[TRT DEBUG] starting ControlNet engine compilation...", flush=True)
+                    print("[TRT DEBUG] starting ControlNet engine loading...", flush=True)
                     compiled_cn_engines = []
                     for cfg, cn_model in zip(configs, cn_module.controlnets):
-                        if _skip_cn_trt:
-                            continue
                         if not cfg or not cfg.get('model_id') or cn_model is None:
                             continue
-                        try:
-                            engine = engine_manager.get_or_load_controlnet_engine(
-                                model_id=cfg['model_id'],
-                                pytorch_model=cn_model,
-                                model_type=model_type,
-                                batch_size=stream.trt_unet_batch_size,
-                                max_batch_size=self.max_batch_size,
-                                min_batch_size=self.min_batch_size,
-                                cuda_stream=cuda_stream,
-                                use_cuda_graph=False,
-                                unet=None,
-                                model_path=cfg['model_id'],
-                                load_engine=load_engine,
-                                conditioning_channels=cfg.get('conditioning_channels', 3)
-                            )
+
+                        # Try to load pre-built ControlNet TRT engine first
+                        cn_engine_loaded = False
+                        if load_engine and acceleration == "tensorrt":
+                            # Check for pre-built engine in cn_test directory
+                            _cn_engine_path = os.path.join(engine_dir, "cn_test", "controlnet.engine")
+                            if os.path.exists(_cn_engine_path):
+                                from streamdiffusion.acceleration.tensorrt.runtime_engines.controlnet_engine import ControlNetModelEngine
+                                # Try loading, retry once after freeing memory if it fails
+                                for _attempt in range(2):
+                                    try:
+                                        engine = ControlNetModelEngine(
+                                            _cn_engine_path, cuda_stream,
+                                            use_cuda_graph=False,
+                                            model_type=model_type
+                                        )
+                                        setattr(engine, 'model_id', cfg['model_id'])
+                                        compiled_cn_engines.append(engine)
+                                        cn_engine_loaded = True
+                                        print(f"[TRT] Loaded pre-built ControlNet engine: {_cn_engine_path}", flush=True)
+                                        break
+                                    except Exception as e:
+                                        if _attempt == 0:
+                                            logger.warning(f"CN engine load attempt 1 failed: {e}, freeing memory and retrying...")
+                                            # Move PyTorch CN to CPU + free caches
+                                            if cn_model is not None and hasattr(cn_model, 'to'):
+                                                cn_module.controlnets[cn_module.controlnets.index(cn_model)] = cn_model.to('cpu')
+                                            import gc; gc.collect(); torch.cuda.empty_cache()
+                                        else:
+                                            logger.warning(f"Failed to load pre-built ControlNet engine: {e}")
+
+                        # Fall back to compiling via engine_manager (skip on Blackwell — causes segfault)
+                        if not cn_engine_loaded and torch.cuda.get_device_capability()[0] < 12:
                             try:
+                                engine = engine_manager.get_or_load_controlnet_engine(
+                                    model_id=cfg['model_id'],
+                                    pytorch_model=cn_model,
+                                    model_type=model_type,
+                                    batch_size=stream.trt_unet_batch_size,
+                                    max_batch_size=self.max_batch_size,
+                                    min_batch_size=self.min_batch_size,
+                                    cuda_stream=cuda_stream,
+                                    use_cuda_graph=False,
+                                    unet=None,
+                                    model_path=cfg['model_id'],
+                                    load_engine=load_engine,
+                                    conditioning_channels=cfg.get('conditioning_channels', 3)
+                                )
                                 setattr(engine, 'model_id', cfg['model_id'])
-                            except Exception:
-                                pass
-                            compiled_cn_engines.append(engine)
-                        except Exception as e:
-                            logger.warning(f"Failed to compile/load ControlNet engine for {cfg.get('model_id')}: {e}")
+                                compiled_cn_engines.append(engine)
+                            except Exception as e:
+                                logger.warning(f"Failed to compile/load ControlNet engine for {cfg.get('model_id')}: {e}")
+
                     if compiled_cn_engines:
                         setattr(stream, 'controlnet_engines', compiled_cn_engines)
-                        try:
-                            logger.info(f"Compiled/loaded {len(compiled_cn_engines)} ControlNet TensorRT engine(s)")
-                        except Exception:
-                            pass
+                        logger.info(f"Loaded {len(compiled_cn_engines)} ControlNet TensorRT engine(s)")
+                        # Disable CUDA graph on UNet — conflicts with CN TRT in the hook
+                        if hasattr(stream, 'unet') and hasattr(stream.unet, 'use_cuda_graph'):
+                            stream.unet.use_cuda_graph = False
+                            if hasattr(stream.unet, 'engine'):
+                                stream.unet.engine.reset_cuda_graph()
+                            logger.info("Disabled UNet CUDA graph (ControlNet TRT active)")
+                        # Free PyTorch ControlNet models from GPU since TRT engines replace them
+                        import gc
+                        for i, cn_model in enumerate(cn_module.controlnets):
+                            eng_mid = None
+                            for eng in compiled_cn_engines:
+                                if getattr(eng, 'model_id', None) == getattr(cn_model, 'model_id', None):
+                                    eng_mid = getattr(eng, 'model_id', None)
+                                    break
+                            if eng_mid:
+                                cn_module.controlnets[i] = cn_model.to('cpu')
+                                logger.info(f"Moved PyTorch ControlNet '{eng_mid}' to CPU (TRT engine loaded)")
+                        gc.collect()
+                        torch.cuda.empty_cache()
                 except Exception:
                     import traceback
                     traceback.print_exc()

@@ -263,15 +263,15 @@ def _updater():
 # Live update functions (no reload)
 # ============================================================
 def live_prompt(prompt):
-    u = _updater()
-    if u:
-        u.update_stream_params(prompt_list=[(prompt, 1.0)])
+    # Go through wrapper to handle text encoder reload/offload for TRT
+    if state.wrapper:
+        state.wrapper.update_stream_params(prompt_list=[(prompt, 1.0)])
     return gr.update()
 
 def live_negative(neg):
-    u = _updater()
-    if u:
-        u.update_stream_params(negative_prompt=neg)
+    # Negative prompt also needs text encoder for CFG modes
+    if state.wrapper:
+        state.wrapper.update_stream_params(negative_prompt=neg)
     return gr.update()
 
 def live_guidance(val):
