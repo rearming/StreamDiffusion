@@ -349,10 +349,18 @@ def load_pipeline(
     style_image,
 ):
     if state.wrapper is not None:
+        import torch, gc
+        # Force full cleanup of old pipeline
+        try:
+            if hasattr(state.wrapper, 'stream'):
+                del state.wrapper.stream
+        except Exception:
+            pass
         del state.wrapper
         state.wrapper = None
-        import torch
+        gc.collect()
         torch.cuda.empty_cache()
+        gc.collect()
 
     state.width = int(width)
     state.height = int(height)
@@ -532,26 +540,58 @@ def stream_video(video_path):
             fr_rgb = cv2.cvtColor(fr, cv2.COLOR_BGR2RGB)
             pil = Image.fromarray(fr_rgb)
 
+            t_cn = time.time()
             if state.wrapper.use_controlnet:
                 state.wrapper.update_control_image(0, pil)
+            dt_cn = time.time() - t_cn
+
             if state.wrapper.use_ipadapter:
                 state.wrapper.update_style_image(pil, is_stream=True)
 
+            t_infer = time.time()
             if state.wrapper.mode == "img2img":
                 out = state.wrapper.img2img(pil)
             else:
                 out = state.wrapper.txt2img()
+            dt_infer = time.time() - t_infer
+
+            t_post = time.time()
+            out_np = _to_numpy(out)
+            dt_post = time.time() - t_post
 
             dt = time.time() - t0
             fps_i = 1.0 / dt if dt > 0 else 0
             fps_smooth = fps_smooth * 0.9 + fps_i * 0.1
             idx += 1
 
-            yield fr_rgb, _to_numpy(out), f"Frame {idx}/{total} | {fps_smooth:.1f} FPS | {dt*1000:.0f}ms"
+            # Print breakdown every 10 frames
+            if idx % 10 == 1:
+                print(f"[PERF #{idx}] total={dt*1000:.0f}ms cn={dt_cn*1000:.0f}ms infer={dt_infer*1000:.0f}ms post={dt_post*1000:.0f}ms", flush=True)
+
+            yield fr_rgb, out_np, f"Frame {idx}/{total} | {fps_smooth:.1f} FPS | {dt*1000:.0f}ms (cn={dt_cn*1000:.0f} inf={dt_infer*1000:.0f})"
     finally:
         cap.release()
         state.running = False
 
+
+def unload_pipeline():
+    """Free all GPU/CPU memory from the current pipeline."""
+    if state.wrapper is None:
+        return "No pipeline loaded"
+    import torch, gc
+    state.running = False
+    try:
+        if hasattr(state.wrapper, 'stream'):
+            del state.wrapper.stream
+    except Exception:
+        pass
+    del state.wrapper
+    state.wrapper = None
+    gc.collect()
+    torch.cuda.empty_cache()
+    gc.collect()
+    allocated = torch.cuda.memory_allocated() / 1024**3
+    return f"Unloaded. GPU: {allocated:.2f}GB allocated"
 
 def stop_stream():
     state.running = False
@@ -632,7 +672,9 @@ def _build_generate_tab(s):
                 c["style_image_path"] = gr.Textbox(
                     value=s["style_image_path"], visible=False)
 
-            c["load_btn"] = gr.Button("Load Pipeline", variant="primary", size="lg")
+            with gr.Row():
+                c["load_btn"] = gr.Button("Load Pipeline", variant="primary", size="lg")
+                c["unload_btn"] = gr.Button("Unload", variant="stop")
             c["load_status"] = gr.Textbox(label="Status", interactive=False)
 
             with gr.Accordion("Presets", open=False):
@@ -770,6 +812,7 @@ def build_ui():
         ]
 
         c["load_btn"].click(fn=load_pipeline, inputs=_load_inputs, outputs=[c["load_status"]])
+        c["unload_btn"].click(fn=unload_pipeline, outputs=[c["load_status"]])
 
         # Streaming
         c["single_btn"].click(

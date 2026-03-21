@@ -295,16 +295,50 @@ class Engine:
                 CUASSERT(cudart.cudaGraphDestroy(self.graph))
                 self.graph = None
         
+        # Two-pass allocation: set input shapes first, then allocate all tensors
+        # This lets TensorRT infer output shapes from the inputs (needed for dynamic shapes)
+
+        # Pass 1: set input shapes on the context
         for idx in range(self.engine.num_io_tensors):
             name = self.engine.get_tensor_name(idx)
+            mode = self.engine.get_tensor_mode(name)
+            if mode == trt.TensorIOMode.INPUT:
+                if shape_dict and name in shape_dict:
+                    self.context.set_input_shape(name, shape_dict[name])
+
+        # Debug: check if all inputs were set
+        _all_shapes_resolved = self.context.all_shape_inputs_specified
+        if not _all_shapes_resolved:
+            missing = []
+            for idx in range(self.engine.num_io_tensors):
+                name = self.engine.get_tensor_name(idx)
+                mode = self.engine.get_tensor_mode(name)
+                if mode == trt.TensorIOMode.INPUT and (not shape_dict or name not in shape_dict):
+                    missing.append(name)
+            print(f"[TRT allocate_buffers] NOT all input shapes set! missing={missing}", flush=True)
+            print(f"[TRT allocate_buffers] shape_dict keys={list(shape_dict.keys()) if shape_dict else 'None'}", flush=True)
+
+        # Pass 2: allocate tensors (output shapes are now resolved by the context)
+        for idx in range(self.engine.num_io_tensors):
+            name = self.engine.get_tensor_name(idx)
+            mode = self.engine.get_tensor_mode(name)
 
             if shape_dict and name in shape_dict:
                 shape = shape_dict[name]
+            elif mode == trt.TensorIOMode.OUTPUT:
+                # Get inferred output shape from context (resolves dynamic dims)
+                shape = self.context.get_tensor_shape(name)
+                if any(d < 0 for d in shape):
+                    print(f"[TRT] OUTPUT '{name}' still has dynamic dims: {list(shape)}", flush=True)
+                    print(f"[TRT] all_inputs_specified={self.context.all_shape_inputs_specified}", flush=True)
+                    # Fallback: match output to 'sample' input shape if available
+                    if shape_dict and 'sample' in shape_dict:
+                        shape = shape_dict['sample']
+                        print(f"[TRT] Using sample shape as fallback: {list(shape)}", flush=True)
             else:
                 shape = self.engine.get_tensor_shape(name)
 
             dtype_np = trt.nptype(self.engine.get_tensor_dtype(name))
-            mode = self.engine.get_tensor_mode(name)
 
             if mode == trt.TensorIOMode.INPUT:
                 self.context.set_input_shape(name, shape)
@@ -638,7 +672,14 @@ def optimize_onnx(
     
     # Check if external data files exist (indicating external data format was used)
     onnx_dir = os.path.dirname(onnx_path)
-    external_data_files = [f for f in os.listdir(onnx_dir) if f.endswith('.pb')]
+    onnx_basename = os.path.basename(onnx_path)
+    # External data can be .pb files or extensionless files (e.g. onnx__Add_18237)
+    external_data_files = [
+        f for f in os.listdir(onnx_dir)
+        if os.path.isfile(os.path.join(onnx_dir, f))
+        and f != onnx_basename
+        and (f.endswith('.pb') or '.' not in f)
+    ]
     uses_external_data = len(external_data_files) > 0
     
     if uses_external_data:
@@ -683,11 +724,13 @@ def optimize_onnx(
             import shutil
             opt_dir = os.path.dirname(onnx_opt_path)
             os.makedirs(opt_dir, exist_ok=True)
-            shutil.copy2(onnx_path, onnx_opt_path)
+            # Skip copy if src and dst resolve to the same file
+            if os.path.abspath(onnx_path) != os.path.abspath(onnx_opt_path):
+                shutil.copy2(onnx_path, onnx_opt_path)
             for f in os.listdir(onnx_dir):
                 src = os.path.join(onnx_dir, f)
                 dst = os.path.join(opt_dir, f)
-                if src != onnx_path and os.path.isfile(src):
+                if os.path.abspath(src) != os.path.abspath(dst) and os.path.isfile(src):
                     shutil.copy2(src, dst)
         else:
             onnx_opt_graph = model_data.optimize(onnx.load(onnx_path))

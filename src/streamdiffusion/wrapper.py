@@ -288,6 +288,7 @@ class StreamDiffusionWrapper:
         if seed < 0:  # Random seed
             seed = np.random.randint(0, 1000000)
 
+        print("[TRT DEBUG] _load_model done, calling stream.prepare...", flush=True)
         self.stream.prepare(
             "",
             "",
@@ -967,6 +968,7 @@ class StreamDiffusionWrapper:
             logger.warning(f"GPU cleanup warning: {e}")
         
         # Light CUDA cleanup (avoid aggressive context reset - causes segfaults on RTX 50-series)
+        import torch
         torch.cuda.empty_cache()
         logger.info("_load_model: GPU memory cleanup completed")
 
@@ -1652,12 +1654,19 @@ class StreamDiffusionWrapper:
                 traceback.print_exc(file=_f)
             raise Exception("Acceleration has failed.")
 
+        import sys; sys.stdout.flush(); sys.stderr.flush()
+        print("[TRT DEBUG] engines loaded, starting module install...", flush=True)
         # Install modules via hooks instead of patching (wrapper keeps forwarding updates only)
+        print(f"[TRT DEBUG] use_controlnet={use_controlnet}, use_ipadapter={use_ipadapter}", flush=True)
         if use_controlnet:
+            print("[TRT DEBUG] installing ControlNet module...", flush=True)
             try:
                 from streamdiffusion.modules.controlnet_module import ControlNetModule, ControlNetConfig
+                print("[TRT DEBUG] creating ControlNetModule...", flush=True)
                 cn_module = ControlNetModule(device=self.device, dtype=self.dtype)
+                print("[TRT DEBUG] installing ControlNetModule on stream...", flush=True)
                 cn_module.install(stream)
+                print("[TRT DEBUG] ControlNetModule installed", flush=True)
                 # Normalize to list of configs
                 configs = (
                     controlnet_config
@@ -1678,12 +1687,24 @@ class StreamDiffusionWrapper:
                         preprocessor_params=cfg.get('preprocessor_params'),
                     )
                     cn_module.add_controlnet(cn_cfg, control_image=cfg.get('control_image'))
+                print("[TRT DEBUG] ControlNets added, setting module on stream...", flush=True)
                 # Expose for later updates if needed by caller code
                 stream._controlnet_module = cn_module
 
                 try:
+                    # Skip ControlNet TensorRT compilation — it segfaults on Blackwell/5080
+                    # The PyTorch ControlNet will be used instead (still fast, UNet+VAE are TRT)
+                    import torch
+                    _gpu_cap = torch.cuda.get_device_capability(0) if torch.cuda.is_available() else (0, 0)
+                    _skip_cn_trt = _gpu_cap[0] >= 12  # Blackwell = compute 12.0
+                    if _skip_cn_trt:
+                        print(f"[TRT] Skipping ControlNet TRT engine build (compute {_gpu_cap[0]}.{_gpu_cap[1]} / Blackwell) — using PyTorch ControlNet", flush=True)
+
+                    print("[TRT DEBUG] starting ControlNet engine compilation...", flush=True)
                     compiled_cn_engines = []
                     for cfg, cn_model in zip(configs, cn_module.controlnets):
+                        if _skip_cn_trt:
+                            continue
                         if not cfg or not cfg.get('model_id') or cn_model is None:
                             continue
                         try:

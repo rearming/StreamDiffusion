@@ -249,7 +249,9 @@ class EngineManager:
     
     def _set_unet_metadata(self, loaded_engine, kwargs: Dict) -> None:
         """Set metadata on UNet engine for runtime use."""
-        setattr(loaded_engine, 'use_control', kwargs.get('use_controlnet_trt', False))
+        # Don't override use_control if auto-detected from engine (it may have CN inputs baked in)
+        if not getattr(loaded_engine, 'use_control', False):
+            setattr(loaded_engine, 'use_control', kwargs.get('use_controlnet_trt', False))
         setattr(loaded_engine, 'use_ipadapter', kwargs.get('use_ipadapter_trt', False))
         
         if kwargs.get('use_controlnet_trt', False):

@@ -30,7 +30,19 @@ class UNet2DConditionModelEngine:
 
         self.engine.load()
         self.engine.activate()
-        
+
+        # Auto-detect if engine was built with ControlNet inputs
+        _trt_engine = self.engine.engine
+        if _trt_engine is not None:
+            for idx in range(_trt_engine.num_io_tensors):
+                name = _trt_engine.get_tensor_name(idx)
+                if name.startswith("input_control_"):
+                    self.use_control = True
+                    print(f"[TRT UNet] Auto-detected ControlNet inputs in engine (use_control=True) id={id(self)}", flush=True)
+                    break
+        else:
+            print("[TRT UNet] WARNING: engine.engine is None after load!", flush=True)
+
         # Cache expensive attribute lookups to avoid repeated getattr calls
         self._use_ipadapter_cached = None
         
@@ -103,34 +115,36 @@ class UNet2DConditionModelEngine:
                 input_dict
             )
         else:
-            # Check if this engine was compiled with ControlNet support but no conditioning is provided
+            # Engine was compiled with ControlNet inputs — provide zero-filled dummies
             if self.use_control:
-                unet_arch = getattr(self, 'unet_arch', {})
-                if unet_arch:
-                    current_latent_height = latent_model_input.shape[2]
-                    current_latent_width = latent_model_input.shape[3]
-                    
-                    # Check if cached dummy inputs exist and have correct dimensions
-                    if (self._cached_dummy_controlnet_inputs is None or 
-                        not hasattr(self, '_cached_latent_dims') or
-                        self._cached_latent_dims != (current_latent_height, current_latent_width)):
-                        
-                        try:
-                            self._cached_dummy_controlnet_inputs = self._generate_dummy_controlnet_specs(latent_model_input)
-                            self._cached_latent_dims = (current_latent_height, current_latent_width)
-                        except RuntimeError:
-                            self._cached_dummy_controlnet_inputs = None
-                    
-                    if self._cached_dummy_controlnet_inputs is not None:
-                        self._add_cached_dummy_inputs(self._cached_dummy_controlnet_inputs, latent_model_input, shape_dict, input_dict)
+                batch = latent_model_input.shape[0]
+                _trt = self.engine.engine
+                for idx in range(_trt.num_io_tensors):
+                    name = _trt.get_tensor_name(idx)
+                    if not name.startswith("input_control_"):
+                        continue
+                    if name in shape_dict:
+                        continue
+                    # Use the opt shape from optimization profile (index 1 = opt)
+                    opt_shape = list(_trt.get_tensor_profile_shape(name, 0)[1])  # [1] = opt
+                    opt_shape[0] = batch  # match current batch
+                    zero = torch.zeros(opt_shape,
+                                       dtype=latent_model_input.dtype,
+                                       device=latent_model_input.device)
+                    shape_dict[name] = zero.shape
+                    input_dict[name] = zero
 
         # Allocate buffers and run inference
+        import time as _time
+        _t0 = _time.perf_counter()
+
         if self.debug_vram:
             allocated_before = torch.cuda.memory_allocated() / 1024**3
             logger.debug(f"VRAM before allocation: {allocated_before:.2f}GB")
-        
+
         self.engine.allocate_buffers(shape_dict=shape_dict, device=latent_model_input.device)
-        
+        _t1 = _time.perf_counter()
+
         if self.debug_vram:
             allocated_after = torch.cuda.memory_allocated() / 1024**3
             logger.debug(f"VRAM after allocation: {allocated_after:.2f}GB")
@@ -144,6 +158,18 @@ class UNet2DConditionModelEngine:
         except Exception as e:
             logger.exception(f"UNet2DConditionModelEngine.__call__: Engine.infer failed: {e}")
             raise
+        _t2 = _time.perf_counter()
+
+        # Timing (first 20 calls only to avoid spam)
+        if not hasattr(self, '_call_count'):
+            self._call_count = 0
+        self._call_count += 1
+        if self._call_count <= 20:
+            alloc_ms = (_t1 - _t0) * 1000
+            infer_ms = (_t2 - _t1) * 1000
+            reused = self.engine._can_reuse_buffers(shape_dict, latent_model_input.device)
+            graph = "graph" if self.use_cuda_graph and self.engine.cuda_graph_instance else "no-graph"
+            print(f"[TRT UNet #{self._call_count}] alloc={alloc_ms:.1f}ms infer={infer_ms:.1f}ms bufs_reused={reused} {graph}")
         
         
         if self.debug_vram:
