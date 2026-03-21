@@ -56,6 +56,7 @@ SETTING_KEYS = [
     "cn_preset", "cn_custom_model", "cn_preprocessor", "cn_scale", "cn_enabled",
     "ipa_preset", "ipa_scale",
     "video_path", "style_image_path",
+    "playback_speed",
     "auto_load_pipeline",
 ]
 
@@ -82,6 +83,7 @@ DEFAULTS = {
     "ipa_scale": 0.6,
     "video_path": "",
     "style_image_path": "",
+    "playback_speed": 1.0,
     # Settings tab
     "auto_load_pipeline": False,
 }
@@ -106,38 +108,28 @@ def _save_settings(settings, path=None):
     except Exception as e:
         print(f"Failed to save settings: {e}")
 
-def _collect_settings(
-    model_preset, custom_model_id, width, height, mode, acceleration,
-    prompt, negative_prompt,
-    guidance_scale, num_inference_steps, delta, seed, cfg_type,
-    cn_preset, cn_custom_model, cn_preprocessor, cn_scale, cn_enabled,
-    ipa_preset, ipa_scale,
-    video_path, style_image_path,
-):
-    return {
-        "model_preset": model_preset,
-        "custom_model_id": custom_model_id,
-        "width": int(width),
-        "height": int(height),
-        "mode": mode,
-        "acceleration": acceleration,
-        "prompt": prompt,
-        "negative_prompt": negative_prompt,
-        "guidance_scale": float(guidance_scale),
-        "num_inference_steps": int(num_inference_steps),
-        "delta": float(delta),
-        "seed": int(seed),
-        "cfg_type": cfg_type,
-        "cn_preset": cn_preset,
-        "cn_custom_model": cn_custom_model,
-        "cn_preprocessor": cn_preprocessor,
-        "cn_scale": float(cn_scale),
-        "cn_enabled": bool(cn_enabled),
-        "ipa_preset": ipa_preset,
-        "ipa_scale": float(ipa_scale),
-        "video_path": video_path or "",
-        "style_image_path": style_image_path or "",
-    }
+def _collect_settings(*args):
+    """Build settings dict from UI component values (order must match SETTING_KEYS)."""
+    s = {}
+    for i, k in enumerate(SETTING_KEYS):
+        if i < len(args):
+            s[k] = args[i]
+        else:
+            s[k] = DEFAULTS.get(k)
+    # Type coercion
+    for k in ("width", "height", "num_inference_steps", "seed"):
+        if k in s and s[k] is not None:
+            s[k] = int(s[k])
+    for k in ("guidance_scale", "delta", "cn_scale", "ipa_scale", "playback_speed"):
+        if k in s and s[k] is not None:
+            s[k] = float(s[k])
+    for k in ("cn_enabled", "auto_load_pipeline"):
+        if k in s:
+            s[k] = bool(s[k])
+    for k in ("video_path", "style_image_path"):
+        if k in s:
+            s[k] = s[k] or ""
+    return s
 
 # Auto-save on any change
 def _autosave(*args):
@@ -149,10 +141,10 @@ def _autosave(*args):
         _save_settings(s)
     return gr.update()
 
-def save_preset(preset_name, *args):
+def save_preset(preset_name, *all_setting_values):
     if not preset_name or not preset_name.strip():
-        return "Enter a preset name first"
-    s = _collect_settings(*args)
+        return "Enter a preset name first", gr.update()
+    s = _collect_settings(*all_setting_values)
     path = PRESETS_DIR / f"{preset_name.strip()}.json"
     _save_settings(s, path)
     presets = list_presets()
@@ -251,6 +243,8 @@ class PipelineState:
         self.paused = False
         self.width = 512
         self.height = 512
+        self.playback_speed = 1.0
+        self.seek_request = None  # set to 0.0-1.0 to seek
 
 state = PipelineState()
 
@@ -310,6 +304,14 @@ def live_cn_enabled(val):
         cn = state.wrapper.stream._controlnet_module
         if cn:
             cn.update_controlnet_enabled(0, bool(val))
+    return gr.update()
+
+def live_playback_speed(val):
+    state.playback_speed = float(val)
+    return gr.update()
+
+def live_video_seek(val):
+    state.seek_request = float(val)
     return gr.update()
 
 def live_ipa_scale(val):
@@ -504,28 +506,53 @@ def process_single_frame(video_path):
 
 def stream_video(video_path):
     if state.wrapper is None:
-        yield None, None, "Pipeline not loaded"
+        yield None, None, "Pipeline not loaded", gr.update()
         return
     if not video_path:
-        yield None, None, "No video"
+        yield None, None, "No video", gr.update()
         return
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        yield None, None, f"Cannot open: {video_path}"
+        yield None, None, f"Cannot open: {video_path}", gr.update()
         return
 
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    video_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     state.running = True
     state.paused = False
     fps_smooth = 0.0
     idx = 0
+    frame_accum = 0.0  # fractional frame counter for speed control
 
     try:
         while state.running:
             if state.paused:
                 time.sleep(0.05)
                 continue
+
+            # Handle seek requests
+            if state.seek_request is not None:
+                seek_frac = state.seek_request
+                state.seek_request = None
+                target_frame = int(seek_frac * max(1, total - 1))
+                cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+                idx = target_frame
+
+            # Speed control: skip frames for speed > 1x
+            speed = state.playback_speed
+            frame_accum += speed
+            frames_to_skip = int(frame_accum) - 1  # -1 because we read one below
+            frame_accum -= int(frame_accum)
+
+            # Skip frames for fast playback
+            for _ in range(frames_to_skip):
+                ret = cap.grab()
+                if not ret:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    idx = 0
+                    break
+                idx += 1
 
             ret, frame = cap.read()
             if not ret:
@@ -564,11 +591,20 @@ def stream_video(video_path):
             fps_smooth = fps_smooth * 0.9 + fps_i * 0.1
             idx += 1
 
-            # Print breakdown every 10 frames
-            if idx % 10 == 1:
-                print(f"[PERF #{idx}] total={dt*1000:.0f}ms cn={dt_cn*1000:.0f}ms infer={dt_infer*1000:.0f}ms post={dt_post*1000:.0f}ms", flush=True)
+            # For slow playback (speed < 1x), delay to match target frame rate
+            if speed < 1.0:
+                target_dt = 1.0 / (video_fps * speed)
+                if dt < target_dt:
+                    time.sleep(target_dt - dt)
 
-            yield fr_rgb, out_np, f"Frame {idx}/{total} | {fps_smooth:.1f} FPS | {dt*1000:.0f}ms (cn={dt_cn*1000:.0f} inf={dt_infer*1000:.0f})"
+            pos = idx / max(1, total)
+
+            if idx % 10 == 1:
+                print(f"[PERF #{idx}] total={dt*1000:.0f}ms cn={dt_cn*1000:.0f}ms infer={dt_infer*1000:.0f}ms post={dt_post*1000:.0f}ms speed={speed}x", flush=True)
+
+            yield (fr_rgb, out_np,
+                   f"Frame {idx}/{total} | {fps_smooth:.1f} FPS | {dt*1000:.0f}ms | {speed}x",
+                   gr.update(value=min(1.0, pos)))
     finally:
         cap.release()
         state.running = False
@@ -611,7 +647,7 @@ def _build_generate_tab(s):
     with gr.Row():
         # ---- LEFT: Controls ----
         with gr.Column(scale=1, min_width=380):
-            with gr.Accordion("Model (reload required)", open=True):
+            with gr.Accordion("Model \u26a0\ufe0f reload required", open=True):
                 c["model_preset"] = gr.Dropdown(
                     list(MODEL_PRESETS.keys()), value=s["model_preset"], label="Preset")
                 c["custom_model_id"] = gr.Textbox(
@@ -634,23 +670,28 @@ def _build_generate_tab(s):
                 c["guidance_scale"] = gr.Slider(
                     0.0, 20.0, value=s["guidance_scale"], step=0.1, label="Guidance Scale")
                 c["num_inference_steps"] = gr.Slider(
-                    1, 100, value=s["num_inference_steps"], step=1, label="Inference Steps")
+                    1, 100, value=s["num_inference_steps"], step=1,
+                    label="Inference Steps \u26a0\ufe0f reload")
                 c["delta"] = gr.Slider(
                     0.0, 1.0, value=s["delta"], step=0.05,
                     label="Delta (higher = more input preserved)")
-                c["seed"] = gr.Number(value=s["seed"], label="Seed (-1 = random)", precision=0)
+                c["seed"] = gr.Slider(
+                    0, 1000, value=max(0, s["seed"]), step=1, label="Seed")
                 c["cfg_type"] = gr.Dropdown(
-                    CFG_TYPES, value=s["cfg_type"], label="CFG Type (reload)")
+                    CFG_TYPES, value=s["cfg_type"],
+                    label="CFG Type \u26a0\ufe0f reload")
 
             with gr.Accordion("ControlNet", open=False):
                 c["cn_preset"] = gr.Dropdown(
                     list(CONTROLNET_PRESETS.keys()), value=s["cn_preset"],
-                    label="Preset (reload)")
+                    label="Preset \u26a0\ufe0f reload")
                 c["cn_custom_model"] = gr.Textbox(
                     value=s["cn_custom_model"],
-                    label="Model ID override", placeholder="e.g. lllyasviel/...")
+                    label="Model ID override \u26a0\ufe0f reload",
+                    placeholder="e.g. lllyasviel/...")
                 c["cn_preprocessor"] = gr.Dropdown(
-                    PREPROCESSORS, value=s["cn_preprocessor"], label="Preprocessor (reload)")
+                    PREPROCESSORS, value=s["cn_preprocessor"],
+                    label="Preprocessor \u26a0\ufe0f reload")
                 c["cn_scale"] = gr.Slider(
                     0.0, 2.0, value=s["cn_scale"], step=0.05, label="CN Scale (live)")
                 c["cn_enabled"] = gr.Checkbox(value=s["cn_enabled"], label="Enabled (live)")
@@ -658,7 +699,7 @@ def _build_generate_tab(s):
             with gr.Accordion("IPAdapter", open=False):
                 c["ipa_preset"] = gr.Dropdown(
                     list(IPADAPTER_PRESETS.keys()), value=s["ipa_preset"],
-                    label="Preset (reload)")
+                    label="Preset \u26a0\ufe0f reload")
                 c["ipa_scale"] = gr.Slider(
                     0.0, 2.0, value=s["ipa_scale"], step=0.05, label="IPA Scale (live)")
                 _restored_style = None
@@ -701,6 +742,14 @@ def _build_generate_tab(s):
                 c["single_btn"] = gr.Button("Single Frame")
                 c["pause_btn"] = gr.Button("Pause/Resume")
                 c["stop_btn"] = gr.Button("Stop", variant="stop")
+
+            with gr.Row():
+                c["video_position"] = gr.Slider(
+                    0.0, 1.0, value=0.0, step=0.001,
+                    label="Position", scale=4)
+                c["playback_speed"] = gr.Slider(
+                    0.25, 4.0, value=s.get("playback_speed", 1.0),
+                    step=0.25, label="Speed", scale=1)
 
             c["stream_status"] = gr.Textbox(label="", interactive=False)
 
@@ -761,6 +810,7 @@ def build_ui():
             c["cn_scale"], c["cn_enabled"],
             c["ipa_preset"], c["ipa_scale"],
             c["video_path_store"], c["style_image_path"],
+            c["playback_speed"],
             c["auto_load_pipeline"],
         ]
 
@@ -791,7 +841,9 @@ def build_ui():
         c["guidance_scale"].release(live_guidance, inputs=[c["guidance_scale"]], outputs=[])
         c["num_inference_steps"].release(live_steps, inputs=[c["num_inference_steps"]], outputs=[])
         c["delta"].release(live_delta, inputs=[c["delta"]], outputs=[])
-        c["seed"].change(live_seed, inputs=[c["seed"]], outputs=[])
+        c["seed"].release(live_seed, inputs=[c["seed"]], outputs=[])
+        c["playback_speed"].release(live_playback_speed, inputs=[c["playback_speed"]], outputs=[])
+        c["video_position"].release(live_video_seek, inputs=[c["video_position"]], outputs=[])
         c["cn_scale"].release(live_cn_scale, inputs=[c["cn_scale"]], outputs=[])
         c["cn_enabled"].change(live_cn_enabled, inputs=[c["cn_enabled"]], outputs=[])
         c["ipa_scale"].release(live_ipa_scale, inputs=[c["ipa_scale"]], outputs=[])
@@ -820,7 +872,8 @@ def build_ui():
             outputs=[c["input_preview"], c["output_preview"], c["stream_status"]])
         c["stream_btn"].click(
             fn=stream_video, inputs=[c["video_input"]],
-            outputs=[c["input_preview"], c["output_preview"], c["stream_status"]])
+            outputs=[c["input_preview"], c["output_preview"], c["stream_status"],
+                     c["video_position"]])
         c["stop_btn"].click(fn=stop_stream, outputs=[c["stream_status"]])
         c["pause_btn"].click(fn=pause_stream, outputs=[c["stream_status"]])
 
