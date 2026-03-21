@@ -175,8 +175,8 @@ class ControlNetModule(OrchestratorUser):
                     # Invalidate prepared tensors and bump version for per-frame reuse
                     self._prepared_tensors = []
                     self._images_version += 1
-                    # Invalidate SDXL conditioning cache
-                    self._sdxl_conditioning_valid = False
+                    # Note: SDXL conditioning (text_embeds/time_ids) doesn't depend on
+                    # control images, so we don't invalidate it here
                     self.prepare_frame_tensors(self.device, self.dtype, 1)
             return
 
@@ -201,8 +201,6 @@ class ControlNetModule(OrchestratorUser):
             # Invalidate prepared cache and bump version after bulk update
             self._prepared_tensors = []
             self._images_version += 1
-            # Invalidate SDXL conditioning cache
-            self._sdxl_conditioning_valid = False
             self.prepare_frame_tensors(self.device, self.dtype, 1)
 
     def update_controlnet_scale(self, index: int, scale: float) -> None:

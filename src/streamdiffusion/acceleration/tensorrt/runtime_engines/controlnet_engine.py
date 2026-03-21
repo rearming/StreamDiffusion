@@ -47,6 +47,8 @@ class ControlNetModelEngine:
             self.mid_downsample_factor = 8
         
         self._shape_cache = {}
+        self._conditioning_scale_tensor = None
+        self._conditioning_scale_value = None
     
     def _resolve_output_shapes(self, batch_size: int, latent_height: int, latent_width: int) -> Dict[str, Tuple[int, ...]]:
         """Optimized shape resolution using pre-computed configurations"""
@@ -81,24 +83,25 @@ class ControlNetModelEngine:
                  time_ids: Optional[torch.Tensor] = None,
                  **kwargs) -> Tuple[List[torch.Tensor], torch.Tensor]:
         """Forward pass through TensorRT ControlNet engine"""
-        import time as _time
-
         if timestep.dtype != torch.float32:
             timestep = timestep.float()
 
-        # Ensure shapes match engine expectations (all 1-dim minimum)
         if timestep.dim() == 0:
             timestep = timestep.unsqueeze(0)
         if timestep.shape[0] != 1:
-            timestep = timestep[:1]  # Engine expects batch=1 timestep
+            timestep = timestep[:1]
 
-        _t0 = _time.perf_counter()
+        # Reuse conditioning_scale tensor to avoid per-frame GPU allocation
+        if self._conditioning_scale_value != conditioning_scale or self._conditioning_scale_tensor is None:
+            self._conditioning_scale_tensor = torch.tensor([conditioning_scale], dtype=sample.dtype, device=sample.device)
+            self._conditioning_scale_value = conditioning_scale
+
         input_dict = {
             "sample": sample,
             "timestep": timestep,
             "encoder_hidden_states": encoder_hidden_states,
             "controlnet_cond": controlnet_cond,
-            "conditioning_scale": torch.tensor([conditioning_scale], dtype=sample.dtype, device=sample.device),
+            "conditioning_scale": self._conditioning_scale_tensor,
         }
 
         if text_embeds is not None:
@@ -107,46 +110,20 @@ class ControlNetModelEngine:
             input_dict["time_ids"] = time_ids
 
         shape_dict = {name: tensor.shape for name, tensor in input_dict.items()}
-
         batch_size = sample.shape[0]
-        latent_height = sample.shape[2]
-        latent_width = sample.shape[3]
-
-        output_shapes = self._resolve_output_shapes(batch_size, latent_height, latent_width)
+        output_shapes = self._resolve_output_shapes(batch_size, sample.shape[2], sample.shape[3])
         shape_dict.update(output_shapes)
-        _t1 = _time.perf_counter()
 
         self.engine.allocate_buffers(shape_dict=shape_dict, device=sample.device)
-        _t2 = _time.perf_counter()
-
-        torch.cuda.synchronize()
-        _t2b = _time.perf_counter()
 
         outputs = self.engine.infer(
             input_dict,
             self.stream,
             use_cuda_graph=self.use_cuda_graph,
         )
-        _t3 = _time.perf_counter()
-
         torch.cuda.synchronize()
-        _t3b = _time.perf_counter()
 
-        down_blocks, mid_block = self._extract_controlnet_outputs(outputs)
-        _t4 = _time.perf_counter()
-
-        if not hasattr(self, '_cn_call_count'):
-            self._cn_call_count = 0
-        self._cn_call_count += 1
-        if self._cn_call_count <= 20:
-            shapes = {k: tuple(v.shape) for k, v in input_dict.items()}
-            print(f"[TRT CN #{self._cn_call_count}] shapes={shapes}", flush=True)
-            print(f"  prep={(_t1-_t0)*1000:.1f}ms alloc={(_t2-_t1)*1000:.1f}ms "
-                  f"sync_before={(_t2b-_t2)*1000:.1f}ms infer={(_t3-_t2b)*1000:.1f}ms "
-                  f"sync_after={(_t3b-_t3)*1000:.1f}ms extract={(_t4-_t3b)*1000:.1f}ms "
-                  f"TOTAL={(_t4-_t0)*1000:.1f}ms", flush=True)
-
-        return down_blocks, mid_block
+        return self._extract_controlnet_outputs(outputs)
     
     def _extract_controlnet_outputs(self, outputs: Dict[str, torch.Tensor]) -> Tuple[List[torch.Tensor], torch.Tensor]:
         """Extract and organize ControlNet outputs from engine results"""

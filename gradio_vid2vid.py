@@ -505,6 +505,8 @@ def process_single_frame(video_path):
 
 
 def stream_video(video_path):
+    import torch, gc
+
     if state.wrapper is None:
         yield None, None, "Pipeline not loaded", gr.update()
         return
@@ -600,11 +602,19 @@ def stream_video(video_path):
             pos = idx / max(1, total)
 
             if idx % 10 == 1:
-                print(f"[PERF #{idx}] total={dt*1000:.0f}ms cn={dt_cn*1000:.0f}ms infer={dt_infer*1000:.0f}ms post={dt_post*1000:.0f}ms speed={speed}x", flush=True)
+                vram_mb = torch.cuda.memory_allocated() / 1024**2
+                print(f"[PERF #{idx}] total={dt*1000:.0f}ms cn={dt_cn*1000:.0f}ms infer={dt_infer*1000:.0f}ms post={dt_post*1000:.0f}ms speed={speed}x VRAM={vram_mb:.0f}MB", flush=True)
+
+            # Periodic cleanup: release PyTorch cached (unused) GPU memory
+            if idx % 100 == 0:
+                torch.cuda.empty_cache()
 
             yield (fr_rgb, out_np,
                    f"Frame {idx}/{total} | {fps_smooth:.1f} FPS | {dt*1000:.0f}ms | {speed}x",
                    gr.update(value=min(1.0, pos)))
+
+            # Free intermediates so GC doesn't have to chase them
+            del frame, fr, fr_rgb, pil, out, out_np
     finally:
         cap.release()
         state.running = False

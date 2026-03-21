@@ -897,10 +897,10 @@ class StreamDiffusion:
         x_0_pred_out = self._apply_latent_postprocessing_hooks(x_0_pred_out)
         
         # Store latent result for latent feedback processors
-        self.prev_latent_result = x_0_pred_out.detach().clone()
+        self.prev_latent_result = x_0_pred_out.detach()
 
         
-        x_output = self.decode_image(x_0_pred_out).detach().clone()
+        x_output = self.decode_image(x_0_pred_out).detach()
         
         # IMAGE POSTPROCESSING HOOKS: After VAE decoding, before final output
         x_output = self._apply_image_postprocessing_hooks(x_output)
@@ -989,10 +989,10 @@ class StreamDiffusion:
         x_0_pred_out = self._apply_latent_postprocessing_hooks(x_0_pred_out)
         
         # Store latent result for latent feedback processors
-        self.prev_latent_result = x_0_pred_out.detach().clone()
+        self.prev_latent_result = x_0_pred_out.detach()
 
         
-        x_output = self.decode_image(x_0_pred_out).detach().clone()
+        x_output = self.decode_image(x_0_pred_out).detach()
         
         # IMAGE POSTPROCESSING HOOKS: After VAE decoding, before final output
         x_output = self._apply_image_postprocessing_hooks(x_output)
@@ -1047,7 +1047,7 @@ class StreamDiffusion:
         x_0_pred_out = self._apply_latent_postprocessing_hooks(x_0_pred_out)
         
         # Store latent result for latent feedback processors
-        self.prev_latent_result = x_0_pred_out.detach().clone()
+        self.prev_latent_result = x_0_pred_out.detach()
 
         
         x_output = self.decode_image(x_0_pred_out)
