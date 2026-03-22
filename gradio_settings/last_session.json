@@ -15,7 +15,7 @@
   "cn_preset": "depth-sdxl (xinsir)",
   "cn_custom_model": "diffusers/controlnet-canny-sdxl-1.0",
   "cn_preprocessor": "depth",
-  "cn_scale": 0.75,
+  "cn_scale": 0.7,
   "cn_enabled": true,
   "ipa_preset": "None",
   "ipa_scale": 0.6,

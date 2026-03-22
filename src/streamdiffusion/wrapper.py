@@ -1,4 +1,5 @@
 import os
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Union, Any, Tuple
 
@@ -1069,23 +1070,30 @@ class StreamDiffusionWrapper:
         if not os.path.exists(model_id_or_path) and '/' in model_id_or_path and not model_id_or_path.endswith('.safetensors'):
             try:
                 from huggingface_hub import list_repo_tree, hf_hub_download
-                repo_files = list(list_repo_tree(model_id_or_path))
-                st_files = [f for f in repo_files if hasattr(f, 'path') and f.path.endswith('.safetensors')]
-                fp16_files = [f for f in st_files if 'fp16' in f.path]
-                fp32_files = [f for f in st_files if 'fp16' not in f.path]
+                # Try list_repo_tree but don't fail on 401 (expired/missing HF token)
+                try:
+                    repo_files = list(list_repo_tree(model_id_or_path))
+                except Exception as _net_err:
+                    logger.info(f"_load_model: list_repo_tree failed ({_net_err}), skipping single-file resolution (will use from_pretrained cache)")
+                    repo_files = None
 
-                # Check if this is a single-file repo (no diffusers-format unet/ directory)
-                has_diffusers_format = any(
-                    hasattr(f, 'path') and f.path.startswith('unet/') and f.path.endswith('.safetensors')
-                    for f in repo_files
-                )
+                if repo_files is not None:
+                    st_files = [f for f in repo_files if hasattr(f, 'path') and f.path.endswith('.safetensors')]
+                    fp16_files = [f for f in st_files if 'fp16' in f.path]
+                    fp32_files = [f for f in st_files if 'fp16' not in f.path]
 
-                if not has_diffusers_format and (fp16_files or fp32_files):
-                    target = fp16_files[0] if (fp16_files and self.dtype == torch.float16) else (fp32_files[0] if fp32_files else None)
-                    if target:
-                        logger.info(f"_load_model: Single-file repo detected. Downloading {target.path} ({target.size/1e9:.1f} GB)...")
-                        resolved_single_file = hf_hub_download(model_id_or_path, target.path)
-                        logger.info(f"_load_model: Downloaded to {resolved_single_file}")
+                    # Check if this is a single-file repo (no diffusers-format unet/ directory)
+                    has_diffusers_format = any(
+                        hasattr(f, 'path') and f.path.startswith('unet/') and f.path.endswith('.safetensors')
+                        for f in repo_files
+                    )
+
+                    if not has_diffusers_format and (fp16_files or fp32_files):
+                        target = fp16_files[0] if (fp16_files and self.dtype == torch.float16) else (fp32_files[0] if fp32_files else None)
+                        if target:
+                            logger.info(f"_load_model: Single-file repo detected. Downloading {target.path} ({target.size/1e9:.1f} GB)...")
+                            resolved_single_file = hf_hub_download(model_id_or_path, target.path)
+                            logger.info(f"_load_model: Downloaded to {resolved_single_file}")
             except Exception as e:
                 logger.warning(f"_load_model: HF repo inspection failed: {e}")
 
@@ -1123,6 +1131,7 @@ class StreamDiffusionWrapper:
         pipe = None
         last_error = None
         _dbg_path = os.path.join(engine_dir, "load_debug.log") if engine_dir else "load_debug.log"
+        os.makedirs(os.path.dirname(os.path.abspath(_dbg_path)), exist_ok=True)
         def _dbg(msg):
             with open(_dbg_path, "a") as _f:
                 import datetime
@@ -1132,12 +1141,32 @@ class StreamDiffusionWrapper:
         for method, method_name in loading_methods:
             try:
                 kwargs = {"torch_dtype": self.dtype}
+                # Prefer fp16 variant to avoid loading massive fp32 weights (segfault on Windows mmap)
+                if "from_pretrained" in method_name and self.dtype == torch.float16:
+                    kwargs["variant"] = "fp16"
+
+                # Clear any leftover GPU memory from previous failed attempts
+                torch.cuda.empty_cache()
 
                 _dbg(f"Trying {method_name} for {model_id_or_path}...")
-                pipe = method(model_id_or_path, **kwargs)
+                try:
+                    pipe = method(model_id_or_path, **kwargs)
+                except OSError:
+                    # fp16 variant may not exist for all models, fall back
+                    kwargs.pop("variant", None)
+                    pipe = method(model_id_or_path, **kwargs)
                 _dbg(f"{method_name} loaded OK on CPU. Moving to {self.device}...")
 
-                pipe = pipe.to(device=self.device)
+                # Move components individually — text encoders first, then UNet
+                # This allows us to track VRAM and avoids loading everything at once
+                if hasattr(pipe, 'text_encoder') and pipe.text_encoder is not None:
+                    pipe.text_encoder = pipe.text_encoder.to(device=self.device)
+                if hasattr(pipe, 'text_encoder_2') and pipe.text_encoder_2 is not None:
+                    pipe.text_encoder_2 = pipe.text_encoder_2.to(device=self.device)
+                if hasattr(pipe, 'vae') and pipe.vae is not None:
+                    pipe.vae = pipe.vae.to(device=self.device)
+                if hasattr(pipe, 'unet') and pipe.unet is not None:
+                    pipe.unet = pipe.unet.to(device=self.device)
                 logger.info(f"_load_model: Successfully loaded using {method_name}")
                 
                 if is_sdxl_model and not isinstance(pipe, StableDiffusionXLPipeline):
@@ -1574,6 +1603,22 @@ class StreamDiffusionWrapper:
                 vae_dtype = stream.vae.dtype
 
                 try:
+                    # Free VRAM before loading TRT engine (~5GB needed)
+                    # Move PyTorch UNet + text encoders to CPU first
+                    if load_engine:
+                        logger.info("Offloading PyTorch models to CPU before TRT engine load...")
+                        if hasattr(stream, 'unet') and stream.unet is not None:
+                            stream.unet.to('cpu')
+                        if hasattr(stream, 'text_encoder') and stream.text_encoder is not None:
+                            stream.text_encoder.to('cpu')
+                        if hasattr(stream, 'pipe'):
+                            if hasattr(stream.pipe, 'text_encoder') and stream.pipe.text_encoder is not None:
+                                stream.pipe.text_encoder.to('cpu')
+                            if hasattr(stream.pipe, 'text_encoder_2') and stream.pipe.text_encoder_2 is not None:
+                                stream.pipe.text_encoder_2.to('cpu')
+                        import gc; gc.collect(); torch.cuda.empty_cache()
+                        logger.info(f"VRAM after offload: {torch.cuda.memory_allocated()/1024**2:.0f}MB")
+
                     logger.info("Loading TensorRT UNet engine...")
                     # Compile and load UNet engine using EngineManager
                     stream.unet = engine_manager.compile_and_load_engine(
@@ -1658,6 +1703,14 @@ class StreamDiffusionWrapper:
                                 stream.pipe.vae = None
                                 logger.info("Deleted PyTorch VAE (TRT VAE active)")
                         import gc; gc.collect(); torch.cuda.empty_cache(); gc.collect()
+
+                        # Restore text encoders to CUDA — needed for prompt encoding in stream.prepare()
+                        if hasattr(stream, 'pipe'):
+                            if hasattr(stream.pipe, 'text_encoder') and stream.pipe.text_encoder is not None:
+                                stream.pipe.text_encoder = stream.pipe.text_encoder.to(self.device)
+                            if hasattr(stream.pipe, 'text_encoder_2') and stream.pipe.text_encoder_2 is not None:
+                                stream.pipe.text_encoder_2 = stream.pipe.text_encoder_2.to(self.device)
+                            logger.info(f"Text encoders restored to {self.device} for prompt encoding")
 
                     except Exception as e:
                         error_msg = str(e).lower()
@@ -1772,6 +1825,29 @@ class StreamDiffusionWrapper:
                     if isinstance(controlnet_config, dict)
                     else []
                 )
+                # Check for pre-built TRT engine BEFORE loading heavy PyTorch models
+                _cn_engine_path = os.path.join(engine_dir, "cn_test", "controlnet.engine") if engine_dir else None
+                _has_trt_engine = _cn_engine_path and os.path.exists(_cn_engine_path) and load_engine and acceleration == "tensorrt"
+
+                # Validate TRT engine can actually deserialize before committing to lightweight path
+                if _has_trt_engine:
+                    try:
+                        from streamdiffusion.acceleration.tensorrt.runtime_engines.controlnet_engine import ControlNetModelEngine
+                        _test_engine = ControlNetModelEngine(
+                            _cn_engine_path, cuda_stream,
+                            use_cuda_graph=False,
+                            model_type=model_type
+                        )
+                        print(f"[TRT] Pre-validated ControlNet engine: {_cn_engine_path}", flush=True)
+                    except Exception as _ve:
+                        logger.warning(f"ControlNet TRT engine invalid ({_ve}), deleting stale engine")
+                        try:
+                            os.remove(_cn_engine_path)
+                        except OSError:
+                            pass
+                        _has_trt_engine = False
+                        _test_engine = None
+
                 for cfg in configs:
                     if not cfg.get('model_id'):
                         continue
@@ -1783,7 +1859,12 @@ class StreamDiffusionWrapper:
                         conditioning_channels=cfg.get('conditioning_channels'),
                         preprocessor_params=cfg.get('preprocessor_params'),
                     )
-                    cn_module.add_controlnet(cn_cfg, control_image=cfg.get('control_image'))
+                    # Skip loading PyTorch ControlNet model if TRT engine exists — saves RAM/VRAM
+                    if _has_trt_engine:
+                        logger.info(f"Skipping PyTorch ControlNet load for '{cfg['model_id']}' (TRT engine available)")
+                        cn_module.add_controlnet_lightweight(cn_cfg, control_image=cfg.get('control_image'))
+                    else:
+                        cn_module.add_controlnet(cn_cfg, control_image=cfg.get('control_image'))
                 print("[TRT DEBUG] ControlNets added, setting module on stream...", flush=True)
                 # Expose for later updates if needed by caller code
                 stream._controlnet_module = cn_module
@@ -1792,41 +1873,20 @@ class StreamDiffusionWrapper:
                     print("[TRT DEBUG] starting ControlNet engine loading...", flush=True)
                     compiled_cn_engines = []
                     for cfg, cn_model in zip(configs, cn_module.controlnets):
-                        if not cfg or not cfg.get('model_id') or cn_model is None:
+                        if not cfg or not cfg.get('model_id'):
                             continue
 
-                        # Try to load pre-built ControlNet TRT engine first
+                        # Use pre-validated engine if available
                         cn_engine_loaded = False
-                        if load_engine and acceleration == "tensorrt":
-                            # Check for pre-built engine in cn_test directory
-                            _cn_engine_path = os.path.join(engine_dir, "cn_test", "controlnet.engine")
-                            if os.path.exists(_cn_engine_path):
-                                from streamdiffusion.acceleration.tensorrt.runtime_engines.controlnet_engine import ControlNetModelEngine
-                                # Try loading, retry once after freeing memory if it fails
-                                for _attempt in range(2):
-                                    try:
-                                        engine = ControlNetModelEngine(
-                                            _cn_engine_path, cuda_stream,
-                                            use_cuda_graph=False,
-                                            model_type=model_type
-                                        )
-                                        setattr(engine, 'model_id', cfg['model_id'])
-                                        compiled_cn_engines.append(engine)
-                                        cn_engine_loaded = True
-                                        print(f"[TRT] Loaded pre-built ControlNet engine: {_cn_engine_path}", flush=True)
-                                        break
-                                    except Exception as e:
-                                        if _attempt == 0:
-                                            logger.warning(f"CN engine load attempt 1 failed: {e}, freeing memory and retrying...")
-                                            # Move PyTorch CN to CPU + free caches
-                                            if cn_model is not None and hasattr(cn_model, 'to'):
-                                                cn_module.controlnets[cn_module.controlnets.index(cn_model)] = cn_model.to('cpu')
-                                            import gc; gc.collect(); torch.cuda.empty_cache()
-                                        else:
-                                            logger.warning(f"Failed to load pre-built ControlNet engine: {e}")
+                        if _has_trt_engine and _test_engine is not None:
+                            setattr(_test_engine, 'model_id', cfg['model_id'])
+                            compiled_cn_engines.append(_test_engine)
+                            cn_engine_loaded = True
+                            _test_engine = None  # Only use once
+                            print(f"[TRT] Using pre-validated ControlNet engine", flush=True)
 
                         # Fall back to compiling via engine_manager (skip on Blackwell — causes segfault)
-                        if not cn_engine_loaded and torch.cuda.get_device_capability()[0] < 12:
+                        if not cn_engine_loaded and cn_model is not None and torch.cuda.get_device_capability()[0] < 12:
                             try:
                                 engine = engine_manager.get_or_load_controlnet_engine(
                                     model_id=cfg['model_id'],

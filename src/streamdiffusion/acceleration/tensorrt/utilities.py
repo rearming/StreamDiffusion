@@ -615,10 +615,17 @@ def export_onnx(
     
     with torch.inference_mode(), torch.autocast("cuda"):
         inputs = model_data.get_sample_input(opt_batch_size, opt_image_height, opt_image_width)
-        
+        print(f"[ONNX] inputs: {len(inputs)} tensors, batch={opt_batch_size}", flush=True)
+        for _ii, _inp in enumerate(inputs):
+            if isinstance(_inp, torch.Tensor):
+                print(f"  [{_ii}] shape={tuple(_inp.shape)} dtype={_inp.dtype} device={_inp.device}", flush=True)
+        print(f"[ONNX] wrapped_model type: {type(wrapped_model).__name__}", flush=True)
+        print(f"[ONNX] VRAM: {torch.cuda.memory_allocated()/1024**2:.0f}MB", flush=True)
+
         # Determine if we need external data format for large models (like SDXL)
         is_large_model = is_sdxl or (hasattr(model, 'config') and getattr(model.config, 'sample_size', 32) >= 64)
-        
+
+        print("[ONNX] Starting torch.onnx.export...", flush=True)
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=torch.jit.TracerWarning)
             torch.onnx.export(
@@ -632,16 +639,26 @@ def export_onnx(
                 output_names=model_data.get_output_names(),
                 dynamic_axes=model_data.get_dynamic_axes(),
             )
+        print("[ONNX] export complete!", flush=True)
         
         # Convert to external data format for large models (SDXL)
         if is_large_model:
-            import os
-            
-            # Load the exported model
-            onnx_model = onnx.load(onnx_path)
-            
-            # Check if model is large enough to need external data
-            if onnx_model.ByteSize() > 2147483648:  # 2GB
+            import os, gc
+
+            import gc
+
+            # Free GPU memory
+            del wrapped_model, inputs
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            # Check file size before loading — only convert if actually large
+            onnx_file_size = os.path.getsize(onnx_path)
+            print(f"[ONNX] exported file size: {onnx_file_size/1024**2:.0f}MB", flush=True)
+
+            if onnx_file_size > 2147483648:  # 2GB
+                # Load the exported model for external data conversion
+                onnx_model = onnx.load(onnx_path)
                 # Create directory for external data
                 onnx_dir = os.path.dirname(onnx_path)
                 
@@ -655,9 +672,11 @@ def export_onnx(
                     convert_attribute=False,
                 )
                 logger.info(f"Converted to external data format with weights in weights.pb")
-            
-            del onnx_model
-    del wrapped_model
+                del onnx_model
+    try:
+        del wrapped_model
+    except (UnboundLocalError, NameError):
+        pass
     gc.collect()
     torch.cuda.empty_cache()
 
@@ -683,6 +702,25 @@ def optimize_onnx(
     uses_external_data = len(external_data_files) > 0
     
     if uses_external_data:
+        # Check total size — skip graphsurgeon for large models (causes protobuf errors)
+        total_size = sum(
+            os.path.getsize(os.path.join(onnx_dir, f))
+            for f in os.listdir(onnx_dir) if os.path.isfile(os.path.join(onnx_dir, f))
+        )
+        if total_size > 512 * 1024 * 1024:  # >512MB
+            logger.info(f"Large ONNX model with external data (total {total_size / (1024**3):.2f} GB), skipping graphsurgeon optimization")
+            logger.info("TensorRT will optimize during engine build.")
+            opt_dir = os.path.dirname(onnx_opt_path)
+            os.makedirs(opt_dir, exist_ok=True)
+            if os.path.abspath(onnx_path) != os.path.abspath(onnx_opt_path):
+                shutil.copy2(onnx_path, onnx_opt_path)
+            for f in os.listdir(onnx_dir):
+                src = os.path.join(onnx_dir, f)
+                dst = os.path.join(opt_dir, f)
+                if os.path.abspath(src) != os.path.abspath(dst) and os.path.isfile(src) and f != os.path.basename(onnx_path):
+                    shutil.copy2(src, dst)
+            return
+
         # Load model with external data
         onnx_model = onnx.load(onnx_path, load_external_data=True)
         onnx_opt_graph = model_data.optimize(onnx_model)
@@ -736,6 +774,9 @@ def optimize_onnx(
             onnx_opt_graph = model_data.optimize(onnx.load(onnx_path))
             onnx.save(onnx_opt_graph, onnx_opt_path)
     
-    del onnx_opt_graph
+    try:
+        del onnx_opt_graph
+    except NameError:
+        pass
     gc.collect()
     torch.cuda.empty_cache()

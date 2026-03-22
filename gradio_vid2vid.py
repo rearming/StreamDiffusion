@@ -5,7 +5,9 @@ Settings auto-persist to JSON between sessions.
 
 Launch:  python gradio_vid2vid.py
 """
-import os, sys, time, threading, json, shutil
+import os
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+import sys, time, threading, json, shutil
 from pathlib import Path
 import numpy as np
 from PIL import Image

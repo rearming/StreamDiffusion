@@ -56,24 +56,38 @@ class SDXLExportWrapper(torch.nn.Module):
         
     def _test_added_cond_support(self):
         """Test if this SDXL model supports added_cond_kwargs"""
+        # Skip test forward pass if the model is already wrapped (e.g. UnifiedExportWrapper
+        # with ControlNet inputs) — the test would segfault because it doesn't provide
+        # the expected ControlNet tensor inputs. Check base_unet config instead.
+        if self.base_unet is not self.unet:
+            has_added_cond = (
+                hasattr(self.base_unet, 'config') and
+                getattr(self.base_unet.config, 'addition_embed_type', None) == 'text_time'
+            )
+            if has_added_cond:
+                logger.info("SDXL model supports added_cond_kwargs (detected from config, skipped test forward)")
+                return True
+            logger.info("Model does not appear to need added_cond_kwargs (from config)")
+            return False
+
         try:
             # Create minimal test inputs
             sample = torch.randn(1, 4, 8, 8, device='cuda', dtype=torch.float16)
             timestep = torch.tensor([0.5], device='cuda', dtype=torch.float32)
             encoder_hidden_states = torch.randn(1, 77, 2048, device='cuda', dtype=torch.float16)
-            
+
             # Test with added_cond_kwargs
             test_added_cond = {
                 'text_embeds': torch.randn(1, 1280, device='cuda', dtype=torch.float16),
                 'time_ids': torch.randn(1, 6, device='cuda', dtype=torch.float16)
             }
-            
+
             with torch.no_grad():
                 _ = self.unet(sample, timestep, encoder_hidden_states, added_cond_kwargs=test_added_cond)
-            
+
             logger.info("SDXL model supports added_cond_kwargs")
             return True
-            
+
         except Exception as e:
             logger.error(f"SDXL model does not support added_cond_kwargs: {e}")
             return False

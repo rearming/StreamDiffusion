@@ -92,20 +92,16 @@ class ControlNetModule(OrchestratorUser):
         self._sdxl_conditioning_valid = False
         self._engine_type_cache.clear()
 
-    def add_controlnet(self, cfg: ControlNetConfig, control_image: Optional[Union[str, Any, torch.Tensor]] = None) -> None:
-        model = self._load_pytorch_controlnet_model(cfg.model_id, cfg.conditioning_channels)
-
+    def _setup_preprocessor(self, cfg: ControlNetConfig):
+        """Set up preprocessor from config, returns (preprocessor, image_tensor)."""
         preproc = None
         if cfg.preprocessor:
             from streamdiffusion.preprocessing.processors import get_preprocessor
             preproc = get_preprocessor(cfg.preprocessor, pipeline_ref=self._stream)
-            # Apply provided parameters to the preprocessor instance
             if cfg.preprocessor_params:
                 params = cfg.preprocessor_params or {}
-                # If the preprocessor exposes a 'params' dict, update it
                 if hasattr(preproc, 'params') and isinstance(getattr(preproc, 'params'), dict):
                     preproc.params.update(params)
-                # Also set attributes directly when they exist
                 for name, value in params.items():
                     try:
                         if hasattr(preproc, name):
@@ -113,8 +109,6 @@ class ControlNetModule(OrchestratorUser):
                     except Exception:
                         pass
 
-
-            # Align preprocessor target size with stream resolution once (avoid double-resize later)
             try:
                 if hasattr(preproc, 'params') and isinstance(getattr(preproc, 'params'), dict):
                     preproc.params['image_width'] = int(self._stream.width)
@@ -125,6 +119,11 @@ class ControlNetModule(OrchestratorUser):
                     setattr(preproc, 'image_height', int(self._stream.height))
             except Exception:
                 pass
+        return preproc
+
+    def add_controlnet(self, cfg: ControlNetConfig, control_image: Optional[Union[str, Any, torch.Tensor]] = None) -> None:
+        model = self._load_pytorch_controlnet_model(cfg.model_id, cfg.conditioning_channels)
+        preproc = self._setup_preprocessor(cfg)
 
         image_tensor: Optional[torch.Tensor] = None
         if control_image is not None and self._preprocessing_orchestrator is not None:
@@ -136,10 +135,26 @@ class ControlNetModule(OrchestratorUser):
             self.controlnet_scales.append(float(cfg.conditioning_scale))
             self.preprocessors.append(preproc)
             self.enabled_list.append(bool(cfg.enabled))
-            # Invalidate prepared tensors and bump version when graph changes
             self._prepared_tensors = []
             self._images_version += 1
-            # Invalidate SDXL conditioning cache when ControlNet configuration changes
+            self._sdxl_conditioning_valid = False
+
+    def add_controlnet_lightweight(self, cfg: ControlNetConfig, control_image: Optional[Union[str, Any, torch.Tensor]] = None) -> None:
+        """Register a ControlNet slot without loading the PyTorch model (for TRT-only mode)."""
+        preproc = self._setup_preprocessor(cfg)
+
+        image_tensor: Optional[torch.Tensor] = None
+        if control_image is not None and self._preprocessing_orchestrator is not None:
+            image_tensor = self._prepare_control_image(control_image, preproc)
+
+        with self._collections_lock:
+            self.controlnets.append(None)  # No PyTorch model — TRT engine will be used
+            self.controlnet_images.append(image_tensor)
+            self.controlnet_scales.append(float(cfg.conditioning_scale))
+            self.preprocessors.append(preproc)
+            self.enabled_list.append(bool(cfg.enabled))
+            self._prepared_tensors = []
+            self._images_version += 1
             self._sdxl_conditioning_valid = False
 
     def update_control_image_efficient(self, control_image: Union[str, Any, torch.Tensor], index: Optional[int] = None) -> None:
@@ -599,15 +614,22 @@ class ControlNetModule(OrchestratorUser):
                     load_kwargs["local_files_only"] = True
                     controlnet = ControlNetModel.from_pretrained(model_id, **load_kwargs)
             else:
+                # Try local cache first to avoid 401 / segfault from network calls
+                # while TRT engines are active in CUDA context
+                _load_args = (model_id,)
+                _extra = {}
                 if "/" in model_id and model_id.count("/") > 1:
                     parts = model_id.split("/")
-                    repo_id = "/".join(parts[:2])
-                    subfolder = "/".join(parts[2:])
+                    _load_args = ("/".join(parts[:2]),)
+                    _extra["subfolder"] = "/".join(parts[2:])
+                try:
                     controlnet = ControlNetModel.from_pretrained(
-                        repo_id, subfolder=subfolder, **load_kwargs
+                        *_load_args, **{**load_kwargs, **_extra, "local_files_only": True}
                     )
-                else:
-                    controlnet = ControlNetModel.from_pretrained(model_id, **load_kwargs)
+                except Exception:
+                    controlnet = ControlNetModel.from_pretrained(
+                        *_load_args, **{**load_kwargs, **_extra}
+                    )
             controlnet = controlnet.to(device=self.device, dtype=self.dtype)
             # Track model_id for updater diffing
             try:
